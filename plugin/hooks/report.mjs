@@ -29,7 +29,7 @@ export const DEFAULT_SERVER_URL = "http://127.0.0.1:4317";
 export const PROTOCOL_VERSION = 2;
 /** 插件自己的版本，每次上报放在请求头 x-agent-loop-plugin 里，页面据此提示更新。
  *  和 plugin.json 的 version、shared/src/version.ts 的 PLUGIN_VERSION 一致（测试检查） */
-export const PLUGIN_VERSION = "0.2.6";
+export const PLUGIN_VERSION = "0.2.7";
 export const SEND_TIMEOUT_MS = 2000;
 /** SessionEnd 是同步 hook（会话退出时异步进程会被杀掉，见 docs/step0-findings.md）。Claude Code 给 SessionEnd 的
  *  总时间约 1.5 秒，超过就取消并在终端打一行提示；Node 启动的时间也算在里面，所以发送超时要短 */
@@ -966,10 +966,13 @@ export function galaxyUrl(dir, serverUrlValue, withKey = true) {
   return `${url}/#${k && withKey ? `k=${k}&` : ""}g=${id}&mine`;
 }
 
-/** 用系统的浏览器打开网址（参数直接传给程序，不经过 shell）。失败就算了 @param {string} url */
+/** 用系统的浏览器打开网址（参数直接传给程序，不经过 shell）。失败就算了
+ *  Windows 不用 explorer.exe：网址里有 & 时它除了开浏览器，还会多开一个「文档」文件夹窗口；
+ *  url.dll 的 FileProtocolHandler 直接交给默认浏览器，不经过 cmd，& 也不用转义
+ *  @param {string} url */
 function openBrowser(url) {
   try {
-    const [cmd, args] = process.platform === "win32" ? ["explorer.exe", [url]] : process.platform === "darwin" ? ["open", [url]] : ["xdg-open", [url]];
+    const [cmd, args] = process.platform === "win32" ? ["rundll32.exe", ["url.dll,FileProtocolHandler", url]] : process.platform === "darwin" ? ["open", [url]] : ["xdg-open", [url]];
     spawn(cmd, args, { detached: true, stdio: "ignore" }).on("error", () => {}).unref();
     return true;
   } catch { return false; }
