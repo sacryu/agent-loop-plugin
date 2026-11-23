@@ -48,6 +48,15 @@
               "${CLAUDE_PLUGIN_ROOT}/hooks/report.mjs"
             ],
             "async": true
+          },
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/hooks/report.mjs",
+              "--check"
+            ],
+            "timeout": 5
           }
         ]
       }

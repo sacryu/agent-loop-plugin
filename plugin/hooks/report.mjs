@@ -29,7 +29,7 @@ export const DEFAULT_SERVER_URL = "http://127.0.0.1:4317";
 export const PROTOCOL_VERSION = 2;
 /** 插件自己的版本，每次上报放在请求头 x-agent-loop-plugin 里，页面据此提示更新。
  *  和 plugin.json 的 version、shared/src/version.ts 的 PLUGIN_VERSION 一致（测试检查） */
-export const PLUGIN_VERSION = "0.2.3";
+export const PLUGIN_VERSION = "0.2.4";
 export const SEND_TIMEOUT_MS = 2000;
 /** SessionEnd 是同步 hook（会话退出时异步进程会被杀掉，见 docs/step0-findings.md）。Claude Code 给 SessionEnd 的
  *  总时间约 1.5 秒，超过就取消并在终端打一行提示；Node 启动的时间也算在里面，所以发送超时要短 */
@@ -832,6 +832,61 @@ export function reportProblem(target, last, left = []) {
   return null;
 }
 
+// ---- 第一次接上一个星系群时，让 Claude 跟用户讲清楚
+//
+// 页面上发给 Claude Code 的那段话只有一两句（装插件、提醒重载），说明都在这里：插件生效以后，用户在新接上的
+// 星系群里第一次说话时（同步的 UserPromptSubmit hook，会话开始时 Claude 还不会开口），把这段作为上下文交给 Claude，
+// 让它顺带讲一遍会分享什么、怎么加密，问要不要改名字和分享多少。每个星系群只讲一次，记在插件数据目录的 hello.json 里。
+// 这段会进对话、发给模型：只有服务器地址和指纹，不带密钥
+
+const HELLO_MAX = 20;
+export const PLUGIN_REPO = "https://github.com/sacryu/agent-loop-plugin";
+
+/** 讲过的星系群编号 @param {string} dir @returns {string[]} */
+export function helloGroups(dir) {
+  try {
+    const g = JSON.parse(readFileSync(join(dir, "hello.json"), "utf8")).groups;
+    return Array.isArray(g) ? g.filter(x => typeof x === "string" && /^[0-9a-f]{32}$/.test(x)) : [];
+  } catch { return []; }
+}
+
+/** 每一档分享的内容（给 Claude 讲用），按 shareLevel 的 0、1、2 */
+const SHARE_WHAT = [
+  ["anonymous", "only anonymous categories and timings (which kind of tool, how long each step took)"],
+  ["summary", "the project folder name, session titles, each step's tool and target (file name, start of the command, search terms), the first line of errors and the last sentence of each answer; no full inputs or outputs"],
+  ["full", "everything in summary, plus the full prompts, complete tool inputs and outputs, and complete answers"],
+];
+
+/**
+ * 要不要讲、讲什么。不在星系群里、设置有问题、退出过、讲过：返回 null。要讲时先记下来（同时开着的几个会话只讲一次）
+ * @param {string} dir @param {{ url: string, k: string | null }} target @param {string} share @param {string} me
+ * @returns {string | null}
+ */
+export function helloContext(dir, target, share, me) {
+  if (!hasScheme(target.url) || isLocal(target.url) || !target.k) return null;
+  const keys = deriveKeys(target.k);
+  if (!keys || leftGroups(dir).includes(keys.group)) return null;
+  const done = helloGroups(dir);
+  if (done.includes(keys.group)) return null;
+  try {
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, "hello.json"), tmp = `${file}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify({ groups: [...done, keys.group].slice(-HELLO_MAX) }) + "\n", { mode: 0o600 });
+    renameSync(tmp, file);
+  } catch { return null; }   // 记不下来就不讲：不然每句话都讲一遍
+  const [level, what] = SHARE_WHAT[shareLevel(share, false)];
+  return [
+    `The Agent Loop plugin just connected this computer to galaxy group ${fingerprint(keys.group)} on ${target.url}. This note appears only once.`,
+    "Deal with the user's message as usual. In the same reply, add a short note in the user's language (a few lines, no headings) that covers:",
+    "- What it is: Agent Loop draws running Claude Code sessions as a galaxy (each session a planet, each tool call a ray), and people in the group can see each other's.",
+    `- What is shared now (share = ${share || "auto"}, which means ${level} for this server): ${what}.`,
+    "- Encryption: apart from anonymous categories and timings, everything is encrypted (AES-256-GCM) with the key in the invite link. The key never goes to the server, so the server can't read it; only people with the link can.",
+    `- Permissions: the plugin is only hooks plus 3 slash commands. Its hook script picks allowed fields out of each event and sends them; it doesn't change any code and has no dependencies. Source: ${PLUGIN_REPO}`,
+    `- Ask whether they want to change their name in the group (now: ${me ? JSON.stringify(me) : "an auto-generated catalog number like ALC 1342+27"}) or how much to share (auto, anonymous, summary, full). Change nothing unless they ask. To change, pipe a JSON with only the keys to change into \`claude plugin configure agent-loop@agent-loop --values-stdin\`, for example {"name":"Alice"} or {"share":"anonymous"}, then remind them to run /reload-plugins.`,
+    "- /agent-loop:galaxy opens their galaxy in the browser; /agent-loop:leave takes them out of the group.",
+  ].join("\n");
+}
+
 // ---- 发送
 
 /**
@@ -905,11 +960,21 @@ async function main() {
   const hook = JSON.parse(text);
   const { target, share, me } = settings();
   if (args[0] === "--check") {
-    // 会话开始时的同步检查（hooks.json 里 SessionStart 的第二个 hook）：只读设置和 status.json，不连网络，不拖慢启动。
-    // 异步 hook 的 systemMessage 不会显示给用户，所以这一步必须是同步的。压缩上下文时不重复提示
-    if (hook.source === "compact") return;
-    const problem = nodeProblem(process.versions.node) ?? reportProblem(target, lastStatus(dataDir()), leftGroups(dataDir()));
-    if (problem) await new Promise(r => process.stdout.write(JSON.stringify({ systemMessage: problem }) + "\n", () => r(undefined)));
+    // 同步的检查（hooks.json 里 SessionStart、UserPromptSubmit 的第二个 hook）：只读本机的几个小文件，不连网络。
+    // 异步 hook 的输出不会显示给用户、也不进上下文，所以这一步必须是同步的。
+    // 会话开始时：设置或上次的发送有问题就提示一行（压缩上下文时不重复）。
+    // 用户说话时：第一次接上这个星系群，把说明交给 Claude（helloContext）
+    let out = null;
+    if (hook.hook_event_name === "UserPromptSubmit") {
+      // 设置或上次的发送有问题时不讲（会话开始时已经提示过怎么改）
+      const dir = dataDir(), bad = nodeProblem(process.versions.node) ?? reportProblem(target, lastStatus(dir), leftGroups(dir));
+      const ctx = bad ? null : helloContext(dir, target, share, me);
+      if (ctx) out = { hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: ctx } };
+    } else if (hook.source !== "compact") {
+      const problem = nodeProblem(process.versions.node) ?? reportProblem(target, lastStatus(dataDir()), leftGroups(dataDir()));
+      if (problem) out = { systemMessage: problem };
+    }
+    if (out) await new Promise(r => process.stdout.write(JSON.stringify(out) + "\n", () => r(undefined)));
     return;
   }
   const local = isLocal(target.url);
