@@ -14,6 +14,7 @@
 //   - 用 /agent-loop:leave 退出过的星系群也什么都不发（记在插件数据目录的 left.json 里，/agent-loop:rejoin 去掉）。
 //   - 用接入命令换了群以后，还拿着旧设置的会话也不发（moved.json，/reload-plugins 以后就是新设置了）。
 //   - 附件里出现的邀请密钥（k=…）一律抹掉，不会跟着别的内容发出去。
+//   - 替已经结束、却没把 SessionEnd 送到的会话补发一条 SessionEnd（只有加盐哈希后的会话编号，见 sweepEnded）。
 //
 // 这个文件不能依赖任何包，也不能从仓库其他目录导入（插件装到你机器上时只有 plugin/ 这一个目录）。
 // 任何失败都吞掉：不往标准输出写任何东西，退出码永远是 0。需要 Node 18 以上（自带 fetch）。
@@ -31,7 +32,7 @@ export const DEFAULT_SERVER_URL = "http://127.0.0.1:4317";
 export const PROTOCOL_VERSION = 2;
 /** 插件自己的版本，每次上报放在请求头 x-agent-loop-plugin 里，页面据此提示更新。
  *  和 plugin.json 的 version、shared/src/version.ts 的 PLUGIN_VERSION 一致（测试检查） */
-export const PLUGIN_VERSION = "0.2.12";
+export const PLUGIN_VERSION = "0.2.13";
 /** 第一个由插件建群（/agent-loop:create）的版本：从这一版起页面认 #galaxy=、&created。插件和私有部署分开升级，
  *  所以打开页面前先问服务器的版本（/healthz 的 version），旧的服务器给 #g=，也不在那里建群。
  *  和 shared/src/version.ts 的 CREATE_SINCE 一致（测试检查） */
@@ -908,6 +909,139 @@ export function staleTarget(dir, target, hook) {
   return true;
 }
 
+/**
+ * 旧设置的会话结束了：把 SessionEnd 发给现在的目标（server.json 记着的）。
+ * 跑 /agent-loop:create 或接入命令的会话已经作为 SessionStart 报进了新群，可它自己拿着旧设置、之后什么都不发；
+ * 没有这条 SessionEnd，新群里这颗行星要等两小时才移除（半小时后才变暗），看着像多了一个会话。
+ * 没报进新群的旧会话：服务器上没有这个会话，SessionEnd 直接忽略
+ * @param {string} dir @param {any} hook @param {string} share @param {string} me
+ */
+async function endInCurrent(dir, hook, share, me) {
+  const value = rememberedTarget(dir);
+  if (!value) return;
+  const target = parseTarget(value), local = isLocal(target.url);
+  const keys = target.k ? deriveKeys(target.k) : null;
+  if (!hasScheme(target.url) || (!local && !keys) || movedFrom(dir).includes(targetKey(target))) return;
+  if (keys && leftGroups(dir).includes(keys.group)) return;
+  const { secret, salt } = loadIdentity(dir);
+  const ev = buildEvent(hook, {
+    salt, level: shareLevel(share, local), local, key: keys?.content, gid: galaxyId(secret), me,
+    projectDir: process.env.CLAUDE_PROJECT_DIR,
+  });
+  if (ev) await send(target.url, secret, ev, SESSION_END_TIMEOUT_MS, keys?.access);
+}
+
+// ---- 替结束了却没送出 SessionEnd 的会话补发（sweep.json）
+//
+// SessionEnd 送不到的会话（点 × 关了窗口、进程崩了、发送超时、旧版插件把它拦下了、服务器升级后不收旧格式）在群里要挂两个
+// 小时才被服务器移除，看着像多了一个会话。那个会话自己已经不在了，只能由还活着的会话（跑着新插件）替它发，服务器新旧都认。
+// Claude Code 在 <配置目录>/sessions/<进程号>.json 里登记正在跑的会话（交互的和 claude -p 都有，正常退出时删掉）：
+// 不在登记里、或者登记的进程已经没了的，就是结束了。候选是最近两小时（服务器移除会话的时间）动过的会话记录。
+// 登记是 Claude Code 内部的文件，所以很保守：登记里找不到自己这个会话（这个版本不登记、换了格式）、有登记读不懂，就不扫；
+// 记录刚动过不到一分钟的不算（可能刚开、还没登记）。宁可不清，不能把开着的会话从页面上拿掉
+
+const SWEEP_EVERY_MS = 60_000, SWEEP_QUIET_MS = 60_000, SWEEP_WINDOW_MS = 2 * 3600_000, SWEEP_MAX = 30;
+
+/** 进程还在不在。没权限看（EPERM）也是在 @param {number} pid */
+function alive(pid) {
+  try { process.kill(pid, 0); return true; } catch (e) { return /** @type {any} */ (e)?.code === "EPERM"; }
+}
+
+/**
+ * Claude Code 登记着、进程还在的会话编号。没有登记目录、有一个读不懂：返回 null（不知道，别扫）
+ * @param {string} cfg @param {(pid: number) => boolean} [isAlive] @returns {Set<string> | null}
+ */
+export function liveSessions(cfg, isAlive = alive) {
+  /** @type {string[]} */
+  let names;
+  try { names = readdirSync(join(cfg, "sessions")); } catch { return null; }
+  const live = new Set();
+  for (const f of names) {
+    if (!/^\d+\.json$/.test(f)) continue;
+    try {
+      const o = JSON.parse(readFileSync(join(cfg, "sessions", f), "utf8"));
+      if (typeof o.sessionId !== "string" || !Number.isInteger(o.pid) || o.pid <= 0) return null;
+      if (isAlive(o.pid)) live.add(o.sessionId);
+    } catch (e) {
+      if (/** @type {any} */ (e)?.code === "ENOENT") continue;   // 读的时候刚好退出、删掉了
+      return null;   // 正在写、格式变了：这次不扫
+    }
+  }
+  return live;
+}
+
+/**
+ * 最近 SWEEP_WINDOW_MS 内动过、又安静了 SWEEP_QUIET_MS 以上的会话（会话记录 <配置目录>/projects/<任意>/<编号>.jsonl）和记录最后动的时间
+ * @param {string} cfg @param {number} now @returns {{ sid: string, mtime: number }[]}
+ */
+export function recentSessions(cfg, now) {
+  const root = join(cfg, "projects");
+  /** @type {{ sid: string, mtime: number }[]} */
+  const out = [];
+  /** @type {string[]} */
+  let dirs;
+  try { dirs = readdirSync(root); } catch { return out; }
+  for (const d of dirs) {
+    /** @type {string[]} */
+    let files;
+    try { files = readdirSync(join(root, d)); } catch { continue; }
+    for (const f of files) {
+      if (!f.endsWith(".jsonl")) continue;
+      const sid = f.slice(0, -6);
+      if (!/^[A-Za-z0-9-]{1,80}$/.test(sid)) continue;
+      try {
+        const mtime = statSync(join(root, d, f)).mtimeMs, age = now - mtime;
+        if (age < SWEEP_WINDOW_MS && age > SWEEP_QUIET_MS) out.push({ sid, mtime });
+      } catch { /* 刚被删 */ }
+    }
+  }
+  return out;
+}
+
+/** 上次扫的时间；补发过的会话 → 补发时它的记录最后动的时间（之后又 --resume 过、又动了，就再补一次）
+ *  @param {string} dir @returns {{ at: number, done: Record<string, number> }} */
+function readSweep(dir) {
+  try {
+    const o = JSON.parse(readFileSync(join(dir, "sweep.json"), "utf8"));
+    const done = o && typeof o.done === "object" && o.done ? o.done : {};
+    return { at: typeof o.at === "number" ? o.at : 0, done };
+  } catch { return { at: 0, done: {} }; }
+}
+
+/** @param {string} dir @param {{ at: number, done: Record<string, number> }} s */
+function writeSweep(dir, s) {
+  const file = join(dir, "sweep.json");
+  try {
+    mkdirSync(dir, { recursive: true });
+    const tmp = `${file}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify(s) + "\n", { mode: 0o600 });
+    renameSync(tmp, file);
+  } catch { /* 写不了：下次再扫一遍，服务器对没有的会话的 SessionEnd 什么都不做 */ }
+}
+
+/**
+ * 找出结束了的会话，给 send 补发 SessionEnd（每个只发一次）。返回补发了哪些会话编号
+ * @param {object} o
+ * @param {string} o.dir 插件数据目录 @param {string} o.cfg Claude Code 的配置目录 @param {string} o.self 跑这个 hook 的会话
+ * @param {(sid: string) => Promise<unknown>} o.end 发一条 SessionEnd
+ * @param {number} [o.now] @param {(pid: number) => boolean} [o.isAlive]
+ * @returns {Promise<string[]>}
+ */
+export async function sweepEnded({ dir, cfg, self, end, now = Date.now(), isAlive = alive }) {
+  const state = readSweep(dir);
+  if (now - state.at < SWEEP_EVERY_MS) return [];
+  const live = liveSessions(cfg, isAlive);
+  if (!live || !live.has(self)) return [];
+  for (const [sid, t] of Object.entries(state.done)) if (typeof t !== "number" || now - t > SWEEP_WINDOW_MS) delete state.done[sid];
+  const gone = recentSessions(cfg, now)
+    .filter(x => x.sid !== self && !live.has(x.sid) && !(state.done[x.sid] >= x.mtime)).slice(0, SWEEP_MAX);
+  for (const x of gone) state.done[x.sid] = x.mtime;
+  state.at = now;
+  writeSweep(dir, state);   // 先记下：同时跑的 hook 不再发一遍
+  await Promise.all(gone.map(x => end(x.sid).catch(() => {})));
+  return gone.map(x => x.sid);
+}
+
 /** 旧设置的会话里说话、/clear 时提示一行。不带密钥 @param {string} url */
 export const staleMessage = url =>
   `Agent Loop: this session still has the old server_url (${url}) from before you joined another galaxy group, so it is not reporting. Run /reload-plugins to switch it over. (If you switched back to ${url} on purpose, open a new session.)`;
@@ -1623,7 +1757,11 @@ async function main() {
   // 改设置以前开的会话还拿着旧值，不能让它把新会话记下的好地址冲掉
   if (!hasScheme(target.url) || (!local && !keys)) { if (!rememberedTarget(dir)) rememberTarget(dir, value); return; }
   // 换过群以后还没 /reload-plugins 的旧会话：不发，也不把旧链接写回 server.json
-  if (staleTarget(dir, target, hook)) { noteStale(dir); return; }
+  if (staleTarget(dir, target, hook)) {
+    noteStale(dir);
+    if (hook.hook_event_name === "SessionEnd") await endInCurrent(dir, hook, share, me);
+    return;
+  }
   rememberTarget(dir, value);
   // 用 /agent-loop:leave 退出过这个星系群：不发（会话开始时的检查会说明）
   if (keys && leftGroups(dir).includes(keys.group)) return;
@@ -1641,6 +1779,18 @@ async function main() {
   let status;
   try { status = await send(target.url, secret, ev, SEND_TIMEOUT_MS, keys?.access); } catch { status = "unreachable"; }
   recordStatus(dir, target.url, status);
+  // 会话开始、说话时（都是异步的 hook，不耽误用户）：替结束了却没送出 SessionEnd 的会话补发。服务器收下了才扫
+  if (status === 204 && !ev.agent && (ev.ev === "SessionStart" || ev.ev === "UserPromptSubmit")) {
+    await sweepEnded({
+      dir, cfg: configDir(), self: String(hook.session_id),
+      end: sid => {
+        const gone = buildEvent({ hook_event_name: "SessionEnd", session_id: sid, reason: "other", cwd: hook.cwd }, {
+          salt, level: shareLevel(share, local), local, key: keys?.content, gid: galaxyId(secret), me, projectDir: process.env.CLAUDE_PROJECT_DIR,
+        });
+        return gone ? send(target.url, secret, gone, SEND_TIMEOUT_MS, keys?.access) : Promise.resolve();
+      },
+    });
+  }
 }
 
 const isMain = (() => {
