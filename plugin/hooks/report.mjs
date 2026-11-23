@@ -11,6 +11,7 @@
 //   - 发往本机（主机名严格是 127.0.0.1、localhost、::1）时附件是明文，数据不出电脑。
 //   - 发往别处时附件一律用 AES-256-GCM 加密，密钥从邀请链接（#k=…）里派生，只在你的插件和看的人的浏览器里。
 //     没有邀请链接（没有密钥）就什么都不发。
+//   - 用 /agent-loop:leave 退出过的星系群也什么都不发（记在插件数据目录的 left.json 里，/agent-loop:rejoin 去掉）。
 //
 // 这个文件不能依赖任何包，也不能从仓库其他目录导入（插件装到你机器上时只有 plugin/ 这一个目录）。
 // 任何失败都吞掉：不往标准输出写任何东西，退出码永远是 0。需要 Node 18 以上（自带 fetch）。
@@ -28,7 +29,7 @@ export const DEFAULT_SERVER_URL = "http://127.0.0.1:4317";
 export const PROTOCOL_VERSION = 2;
 /** 插件自己的版本，每次上报放在请求头 x-agent-loop-plugin 里，页面据此提示更新。
  *  和 plugin.json 的 version、shared/src/version.ts 的 PLUGIN_VERSION 一致（测试检查） */
-export const PLUGIN_VERSION = "0.2.2";
+export const PLUGIN_VERSION = "0.2.3";
 export const SEND_TIMEOUT_MS = 2000;
 /** SessionEnd 是同步 hook（会话退出时异步进程会被杀掉，见 docs/step0-findings.md）。Claude Code 给 SessionEnd 的
  *  总时间约 1.5 秒，超过就取消并在终端打一行提示；Node 启动的时间也算在里面，所以发送超时要短 */
@@ -690,6 +691,73 @@ function rememberedTarget(dir) {
   try { const v = JSON.parse(readFileSync(join(dir, "server.json"), "utf8")).server_url; return typeof v === "string" ? v : ""; } catch { return ""; }
 }
 
+// ---- 退出星系群（/agent-loop:leave）
+//
+// server_url 是敏感设置，命令里改不了它。所以退出是在插件数据目录里记一笔（left.json，存星系群编号），
+// 每个 hook 发送前都看：目标是退出过的群就不发。这样所有窗口里的会话立刻都停，不用重载；
+// 改设置以前开的旧会话拿着旧的邀请链接，也不会把星系又带回群里。想回去用 /agent-loop:rejoin。
+
+const LEFT_MAX = 20;
+
+/** 退出过的星系群编号 @param {string} dir @returns {string[]} */
+export function leftGroups(dir) {
+  try {
+    const g = JSON.parse(readFileSync(join(dir, "left.json"), "utf8")).groups;
+    return Array.isArray(g) ? g.filter(x => typeof x === "string" && /^[0-9a-f]{32}$/.test(x)) : [];
+  } catch { return []; }
+}
+
+/** 记下（on）或者去掉（!on）一个退出过的星系群 @param {string} dir @param {string} group @param {boolean} on */
+export function markLeft(dir, group, on) {
+  const now = leftGroups(dir).filter(g => g !== group);
+  if (on) now.push(group);
+  const file = join(dir, "left.json");
+  mkdirSync(dir, { recursive: true });
+  const tmp = `${file}.${process.pid}.tmp`;
+  writeFileSync(tmp, JSON.stringify({ groups: now.slice(-LEFT_MAX) }) + "\n", { mode: 0o600 });
+  renameSync(tmp, file);
+}
+
+/** 星系群的指纹：编号开头 16 个字符，四个一组（和页面上的一样，用来核对是哪个群） @param {string} group */
+export const fingerprint = group => (group.slice(0, 16).match(/.{1,4}/g) ?? []).join(" ");
+
+/** 告诉服务器这个星系退出了（只能移走自己）。返回 HTTP 状态码，连不上返回 "unreachable"
+ *  @param {string} url @param {string} secret @param {string} access */
+export async function sendLeave(url, secret, access) {
+  try {
+    const res = await fetch(url + "/v1/leave", {
+      method: "POST", headers: { authorization: `Bearer ${secret}`, "x-group": access, "x-agent-loop-plugin": PLUGIN_VERSION },
+      signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
+    });
+    await res.arrayBuffer().catch(() => {});
+    return res.status;
+  } catch { return "unreachable"; }
+}
+
+/**
+ * /agent-loop:leave 和 /agent-loop:rejoin。输出会进对话、发给模型：只有服务器地址和指纹，不带密钥
+ * @param {"leave" | "rejoin"} what @param {string} dir @param {string} value server_url 的值
+ * @returns {Promise<string>}
+ */
+export async function leaveOrRejoin(what, dir, value) {
+  const target = parseTarget(value);
+  const keys = target.k ? deriveKeys(target.k) : null;
+  const how = "To report to this computer instead, set server_url back to http://127.0.0.1:4317 with /plugin configure agent-loop@agent-loop.";
+  if (isLocal(target.url) || !keys) return `Not in a galaxy group: server_url is ${target.url}${target.k ? " (with an incomplete invite link)" : ""}. Nothing to ${what === "leave" ? "leave" : "rejoin"}.`;
+  const fp = fingerprint(keys.group), left = leftGroups(dir).includes(keys.group);
+  if (what === "rejoin") {
+    if (!left) return `Already in galaxy group ${fp} on ${target.url}: this computer is reporting to it.`;
+    markLeft(dir, keys.group, false);
+    return `Rejoined galaxy group ${fp} on ${target.url}. Your galaxy shows up again with the next step in any session.`;
+  }
+  markLeft(dir, keys.group, true);
+  const status = await sendLeave(target.url, loadIdentity(dir).secret, keys.access);
+  const server = status === 204 ? "Your galaxy was removed from the group on the server, together with the full step details stored there."
+    : `The server could not be told (${status === "unreachable" ? "unreachable" : `HTTP ${status}`}); your galaxy stays visible in the group until its sessions time out on the server (shown as possibly closed after 30 minutes, gone within about 2 hours). Run /agent-loop:leave again once the server is reachable to remove it right away.`;
+  return `Left galaxy group ${fp} on ${target.url}. No session on this computer reports to it any more (no reload needed). ${server}\n` +
+    `server_url still holds the invite link. ${how} To rejoin this group later, run /agent-loop:rejoin. Browsers that opened the invite link can still watch the group until they leave it on the page.`;
+}
+
 // ---- 上报不出去时告诉用户
 //
 // 异步 hook 失败时 Claude Code 什么都不显示（docs/step0-findings.md），设错了 server_url 的人只会觉得「装了没用」。
@@ -736,15 +804,20 @@ export const hasScheme = url => /^https?:\/\//i.test(url);
  * 设置或者上次的发送有没有问题。没问题返回 null；有问题返回给用户看的一行字（英文，和插件别的输出一样）。
  * 这行字会显示在 Claude Code 里，也可能进对话：不能带密钥
  * @param {{ url: string, k: string | null }} target @param {{ url: string, status: number | "unreachable" } | null} last
+ * @param {string[]} [left] 退出过的星系群编号（leftGroups）
  */
-export function reportProblem(target, last) {
+export function reportProblem(target, last, left = []) {
   const { url, k } = target;
   const fix = "Paste the whole invite link (…/#k=…) into the Agent Loop plugin's server_url setting, then run /reload-plugins.";
   // 漏了 http://：不替人补（补错成 http:// 会把口令明文发出去），照实说
   if (!hasScheme(url)) return `Agent Loop is not reporting: server_url must start with http:// or https:// (it is "${url}"). ${fix}`;
   if (!isLocal(url)) {
     if (!k) return `Agent Loop is not reporting: server_url points to ${url} but has no group key. ${fix}`;
-    if (!deriveKeys(k)) return `Agent Loop is not reporting: the invite link in server_url is incomplete (the key after #k= must be 43 characters). ${fix}`;
+    const keys = deriveKeys(k);
+    if (!keys) return `Agent Loop is not reporting: the invite link in server_url is incomplete (the key after #k= must be 43 characters). ${fix}`;
+    if (left.includes(keys.group)) {
+      return `Agent Loop is not reporting: you left galaxy group ${fingerprint(keys.group)} with /agent-loop:leave. To report to this computer, set server_url back to http://127.0.0.1:4317 with /plugin configure agent-loop@agent-loop; to rejoin, run /agent-loop:rejoin.`;
+    }
   }
   // 上次的结果只对同一个地址算数：换过地址就等下一次发送
   if (!last || last.url !== url) return null;
@@ -815,8 +888,16 @@ async function main() {
     if (parseTarget(target).k && !args.includes("--no-open") && openBrowser(galaxyUrl(dir, target, true))) {
       out += "\n(opened in your browser with the group key; the key is not shown here)";
     }
-    const problem = nodeProblem(process.versions.node) ?? reportProblem(parseTarget(target), lastStatus(dir));
+    const problem = nodeProblem(process.versions.node) ?? reportProblem(parseTarget(target), lastStatus(dir), leftGroups(dir));
     if (problem) out += `\nProblem: ${problem}`;
+    await new Promise(r => process.stdout.write(out + "\n", () => r(undefined)));
+    return;
+  }
+  if (args[0] === "--leave" || args[0] === "--rejoin") {
+    // /agent-loop:leave、/agent-loop:rejoin：和 /galaxy 一样，数据目录从参数传进来，地址从 server.json 读
+    const dir = args[1] && !args[1].startsWith("${") ? args[1] : dataDir();
+    const given = args[2] && !args[2].startsWith("${") ? args[2] : "";
+    const out = await leaveOrRejoin(args[0] === "--leave" ? "leave" : "rejoin", dir, given || rememberedTarget(dir) || serverUrl());
     await new Promise(r => process.stdout.write(out + "\n", () => r(undefined)));
     return;
   }
@@ -827,7 +908,7 @@ async function main() {
     // 会话开始时的同步检查（hooks.json 里 SessionStart 的第二个 hook）：只读设置和 status.json，不连网络，不拖慢启动。
     // 异步 hook 的 systemMessage 不会显示给用户，所以这一步必须是同步的。压缩上下文时不重复提示
     if (hook.source === "compact") return;
-    const problem = nodeProblem(process.versions.node) ?? reportProblem(target, lastStatus(dataDir()));
+    const problem = nodeProblem(process.versions.node) ?? reportProblem(target, lastStatus(dataDir()), leftGroups(dataDir()));
     if (problem) await new Promise(r => process.stdout.write(JSON.stringify({ systemMessage: problem }) + "\n", () => r(undefined)));
     return;
   }
@@ -840,6 +921,8 @@ async function main() {
   // 改设置以前开的会话还拿着旧值，不能让它把新会话记下的好地址冲掉
   if (!hasScheme(target.url) || (!local && !keys)) { if (!rememberedTarget(dir)) rememberTarget(dir, value); return; }
   rememberTarget(dir, value);
+  // 用 /agent-loop:leave 退出过这个星系群：不发（会话开始时的检查会说明）
+  if (keys && leftGroups(dir).includes(keys.group)) return;
   const { secret, salt } = loadIdentity(dir);
   const ev = buildEvent(hook, {
     salt, level: shareLevel(share, local), local, key: keys?.content, gid: galaxyId(secret), me,
