@@ -42,7 +42,7 @@ The only script that sends anything is [`plugin/hooks/report.mjs`](plugin/hooks/
 | `share` | Sent |
 |---|---|
 | `anonymous` | Only event categories and timings: when you work, how many sessions, which **kind** of tool each step used, how long it took. IDs are salted hashes; the salt never leaves your computer |
-| `summary` | Plus: galaxy name, project folder name, session title, each step's tool and target (file name, start of the command, search term), first line of errors, last sentence of each answer |
+| `summary` | Plus: galaxy name, project folder name, session title (the one Claude Code generates, read from the local transcript), each step's tool and target (file name, start of the command, search term), first line of errors, last sentence of each answer |
 | `full` | Plus: your full prompts, complete tool input and output, complete answers and errors |
 
 Anything beyond anonymous categories and timings is encrypted with AES-256-GCM before it leaves, using a key derived from the invite link (`#k=…`). The part after `#` is never sent to the server, so the server only sees anonymous categories, timings, and ciphertext it cannot read. Without an invite link, nothing is sent to a non-local server. Anyone with the invite link can watch the group and join it: only share it with people you trust.
