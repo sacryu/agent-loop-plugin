@@ -29,7 +29,7 @@ export const DEFAULT_SERVER_URL = "http://127.0.0.1:4317";
 export const PROTOCOL_VERSION = 2;
 /** 插件自己的版本，每次上报放在请求头 x-agent-loop-plugin 里，页面据此提示更新。
  *  和 plugin.json 的 version、shared/src/version.ts 的 PLUGIN_VERSION 一致（测试检查） */
-export const PLUGIN_VERSION = "0.2.7";
+export const PLUGIN_VERSION = "0.2.8";
 export const SEND_TIMEOUT_MS = 2000;
 /** SessionEnd 是同步 hook（会话退出时异步进程会被杀掉，见 docs/step0-findings.md）。Claude Code 给 SessionEnd 的
  *  总时间约 1.5 秒，超过就取消并在终端打一行提示；Node 启动的时间也算在里面，所以发送超时要短 */
@@ -902,6 +902,38 @@ const SHARE_WHAT = [
 ];
 
 /**
+ * 记下这个星系群讲过了。已经讲过、记不下来（记不下来就不讲：不然每句话都讲一遍）返回 false
+ * @param {string} dir @param {string} group
+ */
+function claimHello(dir, group) {
+  const done = helloGroups(dir);
+  if (done.includes(group)) return false;
+  try {
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, "hello.json"), tmp = `${file}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify({ groups: [...done, group].slice(-HELLO_MAX) }) + "\n", { mode: 0o600 });
+    renameSync(tmp, file);
+    return true;
+  } catch { return false; }
+}
+
+/**
+ * 讲的内容：几条要点（英文，交给 Claude 用用户的语言讲）。不带密钥
+ * @param {string} url @param {string} share @param {string} me
+ */
+function helloPoints(url, share, me) {
+  const [level, what] = SHARE_WHAT[shareLevel(share, isLocal(url))];
+  return [
+    "- What it is: Agent Loop draws running Claude Code sessions as a galaxy (each session a planet, each tool call a ray), and people in the group can see each other's.",
+    `- What is shared now (share = ${share || "auto"}, which means ${level} for this server): ${what}.`,
+    "- Encryption: apart from anonymous categories and timings, everything is encrypted (AES-256-GCM) with the key in the invite link. The key never goes to the server, so the server can't read it; only people with the link can.",
+    `- Permissions: the plugin is only hooks plus 3 slash commands. Its hook script picks allowed fields out of each event and sends them; it doesn't change any code and has no dependencies. Source: ${PLUGIN_REPO}`,
+    `- Ask whether they want to change their name in the group (now: ${me ? JSON.stringify(me) : "an auto-generated catalog number like ALC 1342+27"}) or how much to share (auto, anonymous, summary, full). Change nothing unless they ask. To change, pipe a JSON with only the keys to change into \`claude plugin configure agent-loop@agent-loop --values-stdin\`, for example {"name":"Alice"} or {"share":"anonymous"}, then remind them to run /reload-plugins.`,
+    "- /agent-loop:galaxy opens their galaxy in the browser; /agent-loop:leave takes them out of the group.",
+  ];
+}
+
+/**
  * 要不要讲、讲什么。不在星系群里、设置有问题、退出过、讲过：返回 null。要讲时先记下来（同时开着的几个会话只讲一次）
  * @param {string} dir @param {{ url: string, k: string | null }} target @param {string} share @param {string} me
  * @returns {string | null}
@@ -909,26 +941,150 @@ const SHARE_WHAT = [
 export function helloContext(dir, target, share, me) {
   if (!hasScheme(target.url) || isLocal(target.url) || !target.k) return null;
   const keys = deriveKeys(target.k);
-  if (!keys || leftGroups(dir).includes(keys.group)) return null;
-  const done = helloGroups(dir);
-  if (done.includes(keys.group)) return null;
-  try {
-    mkdirSync(dir, { recursive: true });
-    const file = join(dir, "hello.json"), tmp = `${file}.${process.pid}.tmp`;
-    writeFileSync(tmp, JSON.stringify({ groups: [...done, keys.group].slice(-HELLO_MAX) }) + "\n", { mode: 0o600 });
-    renameSync(tmp, file);
-  } catch { return null; }   // 记不下来就不讲：不然每句话都讲一遍
-  const [level, what] = SHARE_WHAT[shareLevel(share, false)];
+  if (!keys || leftGroups(dir).includes(keys.group) || !claimHello(dir, keys.group)) return null;
   return [
     `The Agent Loop plugin just connected this computer to galaxy group ${fingerprint(keys.group)} on ${target.url}. This note appears only once.`,
     "Deal with the user's message as usual. In the same reply, add a short note in the user's language (a few lines, no headings) that covers:",
-    "- What it is: Agent Loop draws running Claude Code sessions as a galaxy (each session a planet, each tool call a ray), and people in the group can see each other's.",
-    `- What is shared now (share = ${share || "auto"}, which means ${level} for this server): ${what}.`,
-    "- Encryption: apart from anonymous categories and timings, everything is encrypted (AES-256-GCM) with the key in the invite link. The key never goes to the server, so the server can't read it; only people with the link can.",
-    `- Permissions: the plugin is only hooks plus 3 slash commands. Its hook script picks allowed fields out of each event and sends them; it doesn't change any code and has no dependencies. Source: ${PLUGIN_REPO}`,
-    `- Ask whether they want to change their name in the group (now: ${me ? JSON.stringify(me) : "an auto-generated catalog number like ALC 1342+27"}) or how much to share (auto, anonymous, summary, full). Change nothing unless they ask. To change, pipe a JSON with only the keys to change into \`claude plugin configure agent-loop@agent-loop --values-stdin\`, for example {"name":"Alice"} or {"share":"anonymous"}, then remind them to run /reload-plugins.`,
-    "- /agent-loop:galaxy opens their galaxy in the browser; /agent-loop:leave takes them out of the group.",
+    ...helloPoints(target.url, share, me),
   ].join("\n");
+}
+
+// ---- 接入：页面上发给 Claude Code 的那段话的最后一行（--welcome）
+//
+// 装插件、设好邀请链接以后，hook 要等用户执行 /reload-plugins（或开新会话）才生效，而 Claude 执行不了斜杠命令。
+// 所以那段话最后让 Claude 直接跑一次这个脚本（从插件市场的目录，路径是固定的）：
+//   - 把正在跑的这个会话（Claude Code 给 Bash 的 CLAUDE_CODE_SESSION_ID）作为一次 SessionStart 报上去：星系马上出现，
+//     用的是和 hook 一样的安装密钥、盐、项目目录（从会话记录里读），重载以后 hook 发来的事件接着画在同一颗行星上
+//   - 带着密钥在浏览器里打开自己的星系（&welcome：页面飞进去，弹一张欢迎卡片）
+//   - 把说明（和第一次说话时 hook 交给 Claude 的同一份要点）打印出来交给 Claude，并记下讲过了，hook 不再讲
+// 这个命令不是 hook，拿不到 CLAUDE_PLUGIN_OPTION_*：地址从参数来，share、name 从用户级 settings.json 的 pluginConfigs 读。
+// 输出会进对话：不带密钥
+
+export const PLUGIN_ID = "agent-loop@agent-loop";
+
+/** Claude Code 的配置目录 @param {Record<string, string | undefined>} [env] */
+export function configDir(env = process.env) {
+  return env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
+}
+
+/** 插件装好以后 Claude Code 给它的数据目录（hook 里的 CLAUDE_PLUGIN_DATA）：<配置目录>/plugins/data/<插件>-<市场> */
+export function installedDataDir(cfg = configDir()) {
+  return join(cfg, "plugins", "data", PLUGIN_ID.replace("@", "-"));
+}
+
+/** 用户级设置里插件的 share、name（不敏感的设置存在这里，见 docs/step0-findings.md） @param {string} cfg */
+export function savedOptions(cfg) {
+  try {
+    const o = JSON.parse(readFileSync(join(cfg, "settings.json"), "utf8")).pluginConfigs?.[PLUGIN_ID]?.options ?? {};
+    return { share: typeof o.share === "string" ? o.share.trim() : "", me: typeof o.name === "string" ? o.name.trim().slice(0, 40) : "" };
+  } catch { return { share: "", me: "" }; }
+}
+
+/** 装着的插件版本（installed_plugins.json）；没装返回 "" @param {string} cfg */
+export function installedVersion(cfg) {
+  try {
+    const e = JSON.parse(readFileSync(join(cfg, "plugins", "installed_plugins.json"), "utf8")).plugins?.[PLUGIN_ID];
+    const v = Array.isArray(e) ? e.find(x => x && typeof x.version === "string")?.version : undefined;
+    return typeof v === "string" ? v : "";
+  } catch { return ""; }
+}
+
+/** a 比 b 旧（只比数字段） @param {string} a @param {string} b */
+export function olderThan(a, b) {
+  const pa = a.split(".").map(Number), pb = b.split(".").map(Number);
+  for (let i = 0; i < 3; i++) { const x = pa[i] || 0, y = pb[i] || 0; if (x !== y) return x < y; }
+  return false;
+}
+
+/** 这个会话的记录：<配置目录>/projects/<任意>/<会话编号>.jsonl。找不到返回 "" @param {string} cfg @param {string} sid */
+export function findTranscript(cfg, sid) {
+  if (!/^[A-Za-z0-9-]{1,80}$/.test(sid)) return "";
+  const root = join(cfg, "projects");
+  try {
+    for (const d of readdirSync(root)) {
+      const p = join(root, d, `${sid}.jsonl`);
+      try { if (statSync(p).isFile()) return p; } catch { /* 不在这里 */ }
+    }
+  } catch { /* 没有 projects */ }
+  return "";
+}
+
+/** 会话启动时的目录（记录里第一个带 cwd 的行）：hook 用的 CLAUDE_PROJECT_DIR 就是它 @param {string} path */
+export function transcriptCwd(path) {
+  if (!path) return "";
+  /** @type {number | undefined} */
+  let fd;
+  try {
+    fd = openSync(path, "r");
+    const buf = Buffer.alloc(Math.min(fstatSync(fd).size, 256 * 1024));
+    readSync(fd, buf, 0, buf.length, 0);
+    for (const line of buf.toString("utf8").split("\n")) {
+      if (!line.includes('"cwd"')) continue;
+      try { const o = JSON.parse(line); if (str(o.cwd)) return o.cwd; } catch { /* 最后一行可能被截断了 */ }
+    }
+  } catch { /* 读不了 */ } finally {
+    if (fd !== undefined) try { closeSync(fd); } catch { /* ignore */ }
+  }
+  return "";
+}
+
+/**
+ * @param {string} value 邀请链接（或者本机地址）
+ * @param {{ cfg: string, dir: string, sid: string, cwd: string, open: boolean }} o
+ * @returns {Promise<string>} 交给 Claude 的输出
+ */
+export async function welcome(value, o) {
+  const target = parseTarget(value), keys = target.k ? deriveKeys(target.k) : null, local = isLocal(target.url);
+  const problem = nodeProblem(process.versions.node) ?? reportProblem(target, null, []);
+  if (problem) {
+    return `Problem: ${problem.replace(/^Agent Loop is not reporting: /, "the invite link given to --welcome is not usable: ")}\n` +
+      "Tell the user this in their language, and ask them to copy the whole message for Claude Code from the Invite panel on the galaxy group's page again. Do not run any other command.";
+  }
+  if (keys && leftGroups(o.dir).includes(keys.group)) markLeft(o.dir, keys.group, false);   // 退出过这个群又拿邀请回来：就是要回去
+  rememberTarget(o.dir, value);
+  const { share, me } = savedOptions(o.cfg);
+  const { secret, salt } = loadIdentity(o.dir);
+
+  /** @type {number | "unreachable" | null} */
+  let status = null;
+  if (o.sid) {
+    const transcript = findTranscript(o.cfg, o.sid), cwd = transcriptCwd(transcript) || o.cwd;
+    const hook = { hook_event_name: "SessionStart", session_id: o.sid, source: "resume", cwd, ...(transcript ? { transcript_path: transcript } : {}) };
+    const ev = buildEvent(hook, {
+      salt, level: shareLevel(share, local), local, key: keys?.content, gid: galaxyId(secret), me, projectDir: cwd,
+      readModel: modelFromTranscript, readUsage: (p, sid) => usageFromTranscript(p, usageCacheFile(o.dir, sid)),
+    });
+    if (ev) {
+      try { status = await send(target.url, secret, ev, SEND_TIMEOUT_MS * 2, keys?.access); } catch { status = "unreachable"; }
+      recordStatus(o.dir, target.url, status);
+    }
+  }
+  const ok = status === null || (typeof status === "number" && status < 300);
+  const where = keys ? `galaxy group ${fingerprint(keys.group)} on ${target.url}` : target.url;
+  const opened = status !== "unreachable" && o.open && openBrowser(`${galaxyUrl(o.dir, value, true)}&welcome`);
+  const lines = [
+    `Agent Loop is set up: this computer reports to ${where}.`,
+    `Their galaxy: ${galaxyUrl(o.dir, value, false)}`,
+  ];
+  if (opened) lines.push(`(opened in the browser${keys ? " with the group key" : ""}; the key is not shown here)`);
+  if (!ok) {
+    const p = status === "unreachable" ? `could not reach ${target.url}. Check that the server is running and reachable from this computer.`
+      : `${target.url} refused the report (HTTP ${status}). The invite link may be wrong or expired.`;
+    lines.push(`Problem: ${p}`);
+  } else if (o.sid) {
+    lines.push("This session is on the map already, but it only starts drawing its steps after the user runs /reload-plugins (Claude can't run it). Sessions that were already open need /reload-plugins too; new sessions report on their own.");
+  } else {
+    lines.push("Their galaxy shows up once the user runs /reload-plugins (Claude can't run it) and says something; new sessions report on their own.");
+  }
+  const have = installedVersion(o.cfg);
+  if (have && olderThan(have, PLUGIN_VERSION)) lines.push(`The installed plugin is ${have}, older than ${PLUGIN_VERSION}: run \`claude plugin update ${PLUGIN_ID}\` now, before /reload-plugins.`);
+  if (keys) claimHello(o.dir, keys.group);   // 这里讲过了：第一次说话时 hook 不再讲
+  lines.push("",
+    "Tell the user, in their language, in a short note (a few lines, no headings): " +
+    (opened ? "their galaxy is open in the browser (give the address above as a link)" : "the address of their galaxy above, as a link") +
+    (ok ? ", that they should run /reload-plugins now" : ", the problem above and how to fix it") + (keys ? ", and:" : "."),
+    ...(keys ? helloPoints(target.url, share, me) : []));
+  return lines.join("\n");
 }
 
 // ---- 发送
@@ -992,6 +1148,16 @@ async function main() {
     }
     const problem = nodeProblem(process.versions.node) ?? reportProblem(parseTarget(target), lastStatus(dir), leftGroups(dir));
     if (problem) out += `\nProblem: ${problem}`;
+    await new Promise(r => process.stdout.write(out + "\n", () => r(undefined)));
+    return;
+  }
+  if (args[0] === "--welcome") {
+    // 接入（页面上那段话的最后一行）：Claude 在 Bash 里跑，从插件市场的目录。数据目录是插件装好以后 hook 用的那个
+    const cfg = configDir(), env = process.env.CLAUDE_PLUGIN_DATA;
+    const out = await welcome(args[1] || "", {
+      cfg, dir: env && !env.startsWith("${") ? env : installedDataDir(cfg),
+      sid: (process.env.CLAUDE_CODE_SESSION_ID || "").trim(), cwd: process.cwd(), open: !args.includes("--no-open"),
+    });
     await new Promise(r => process.stdout.write(out + "\n", () => r(undefined)));
     return;
   }
