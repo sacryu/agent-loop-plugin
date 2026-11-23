@@ -1,0 +1,868 @@
+// Agent Loop 插件的上报脚本：这是唯一会把数据发出本机的代码。
+//
+// Claude Code 每触发一个 hook 事件，就以 `node report.mjs` 起一次这个脚本，把事件数据从标准输入传进来。
+// 脚本用白名单的方式挑出允许的字段，重新拼成一条事件，发到服务器，然后退出。不记任何状态。
+//
+// 隐私规则（详见仓库里的 docs/privacy.md）：
+//   - 每条事件都有匿名字段：类别、耗时、加盐哈希后的编号。盐在本机随机生成，永不上传。
+//   - 分享多少由你在插件设置里选（share）：anonymous 只有匿名字段；summary 另附小附件（星系名、项目名、对话标题、
+//     每一步的工具名和对象、报错第一行、回答最后一句）；full 再附大附件（整句话、工具完整的输入输出、完整的回答和报错）。
+//     没选时本机用 full，非本机用 summary。
+//   - 发往本机（主机名严格是 127.0.0.1、localhost、::1）时附件是明文，数据不出电脑。
+//   - 发往别处时附件一律用 AES-256-GCM 加密，密钥从邀请链接（#k=…）里派生，只在你的插件和看的人的浏览器里。
+//     没有邀请链接（没有密钥）就什么都不发。
+//
+// 这个文件不能依赖任何包，也不能从仓库其他目录导入（插件装到你机器上时只有 plugin/ 这一个目录）。
+// 任何失败都吞掉：不往标准输出写任何东西，退出码永远是 0。需要 Node 18 以上（自带 fetch）。
+
+import { createCipheriv, createHash, hkdfSync, randomBytes } from "node:crypto";
+import { closeSync, fstatSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+import { spawn } from "node:child_process";
+
+/** 默认发往本机（plugin.json 里 userConfig.server_url 的默认值要一起改，测试会检查两处一致）。
+ *  本机没有服务在听时静默失败，没有任何可见影响 */
+export const DEFAULT_SERVER_URL = "http://127.0.0.1:4317";
+export const PROTOCOL_VERSION = 2;
+/** 插件自己的版本，每次上报放在请求头 x-agent-loop-plugin 里，页面据此提示更新。
+ *  和 plugin.json 的 version、shared/src/version.ts 的 PLUGIN_VERSION 一致（测试检查） */
+export const PLUGIN_VERSION = "0.2.2";
+export const SEND_TIMEOUT_MS = 2000;
+/** SessionEnd 是同步 hook（会话退出时异步进程会被杀掉，见 docs/step0-findings.md）。Claude Code 给 SessionEnd 的
+ *  总时间约 1.5 秒，超过就取消并在终端打一行提示；Node 启动的时间也算在里面，所以发送超时要短 */
+export const SESSION_END_TIMEOUT_MS = 600;
+/** 本机、档位 2 附带的原样数据过大时，把长字符串截短 */
+const RAW_MAX_BYTES = 200_000;
+/** 小附件、大附件明文的上限（字节，JSON）。和 shared/ 的 SMALL_MAX_BYTES、FULL_MAX_BYTES 一致 */
+export const SMALL_MAX_BYTES = 600;
+export const FULL_MAX_BYTES = 32 * 1024;
+/** 星系编号、星系群编号的长度（十六进制字符数，128 位）。和 shared/src/attach.ts 的 ID_HEX 一致。
+ *  这两个编号是公开的，服务器靠它们认人，所以比别的哈希（16 个字符）长 */
+export const ID_HEX = 32;
+
+// ---- 和 shared/ 保持一致的表（test/plugin-sync.test.ts 检查）
+
+/** @typedef {"read"|"edit"|"search"|"shell"|"web"|"agent"|"ask"|"plan"|"progress"|"mcp"|"other"} ToolKind */
+/** @typedef {"rate_limit"|"server"|"auth"|"billing"|"max_output"|"other"} ErrKind */
+/** @typedef {0|1|2} Level */
+
+/** @type {Record<string, ToolKind>} */
+export const TOOL_TABLE = {
+  Read: "read", NotebookRead: "read", LS: "read",
+  Edit: "edit", MultiEdit: "edit", Write: "edit", NotebookEdit: "edit",
+  Grep: "search", Glob: "search",
+  Bash: "shell", PowerShell: "shell", BashOutput: "shell", KillBash: "shell", KillShell: "shell",
+  WebFetch: "web", WebSearch: "web",
+  Task: "agent", Agent: "agent",
+  AskUserQuestion: "ask",
+  ExitPlanMode: "plan",
+  TodoWrite: "progress", TaskCreate: "progress", TaskUpdate: "progress", TaskList: "progress", TaskGet: "progress",
+  SubagentHandback: "progress",
+};
+
+export const EVENT_NAMES = [
+  "SessionStart", "SessionEnd", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PostToolUseFailure",
+  "PostToolBatch", "PermissionRequest", "PermissionDenied", "Notification", "Stop", "StopFailure",
+  "SubagentStart", "SubagentStop", "PreCompact", "PostCompact",
+];
+export const SESSION_SOURCES = ["startup", "resume", "clear", "compact", "fork"];
+export const NOTIFICATION_TYPES = [
+  "permission_prompt", "idle_prompt", "auth_success", "elicitation_dialog", "elicitation_complete",
+  "elicitation_response", "agent_needs_input", "agent_completed",
+];
+export const BUILTIN_AGENT_TYPES = ["general-purpose", "Explore", "Plan", "statusline-setup", "claude-code-guide"];
+/** 模型名只认 Claude 的模型名（claude-… 或几个别名），别的（比如自建网关上起的名字）一律不传 */
+export const MODEL_RE = /^(claude-[a-z0-9.-]{1,60}(\[1m\])?|opus|sonnet|haiku|fable)$/;
+export const SHARE_OPTIONS = ["auto", "anonymous", "summary", "full"];
+const TOOL_EVENTS = new Set(["PreToolUse", "PostToolUse", "PostToolUseFailure", "PermissionRequest", "PermissionDenied"]);
+const LOOPBACK = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
+
+/**
+ * 上传的事件。和 shared/src/protocol.ts 的 schema 一一对应。
+ * @typedef {{
+ *   v: 2, level: Level, ev: string, ts: number, sid: string, proj: string,
+ *   agent?: string, prompt?: string, tool?: string, kind?: ToolKind, duration_ms?: number,
+ *   interrupt?: boolean, source?: string, ntype?: string, bg?: number, err_kind?: ErrKind,
+ *   agent_type?: string, agent_type_h?: string, task_note?: boolean, model?: string, ctx_tok?: number, out_tok?: number,
+ *   detail?: Detail, detail_full?: unknown, enc?: string, enc_full?: string, card?: Detail, enc_card?: string, raw?: unknown
+ * }} OutEvent
+ */
+
+/** 小附件的明文（和 shared/ 的 Detail 一致） @typedef {{ me?: string, proj?: string, label?: string, name?: string,
+ *  obj?: string, err?: string, type?: string, say?: string }} Detail */
+
+/** @param {unknown} name @returns {ToolKind} */
+export function toolKind(name) {
+  const n = typeof name === "string" ? name : "";
+  if (Object.prototype.hasOwnProperty.call(TOOL_TABLE, n)) return TOOL_TABLE[n];
+  if (n.startsWith("mcp__")) return "mcp";
+  return "other";
+}
+
+/**
+ * StopFailure 的 error（rate_limit、server_error、authentication_failed……）归类。照搬 Python 版的 error_kind。
+ * @param {unknown} err @returns {ErrKind}
+ */
+export function errorKind(err) {
+  let raw;
+  if (err && typeof err === "object") raw = Object.values(err).map(String).join(" ");
+  else raw = String(err ?? "");
+  const s = raw.toLowerCase();
+  if ((s.includes("rate") && s.includes("limit")) || s.includes("429")) return "rate_limit";
+  if (s.includes("overload") || s.includes("529") || s.includes("busy") || s.includes("server") || /\b5\d\d\b/.test(s)) return "server";
+  if (s.includes("auth") || s.includes("login") || s.includes("401") || s.includes("403") || s.includes("token expired")) return "auth";
+  if (s.includes("billing") || s.includes("credit") || s.includes("payment") || s.includes("quota")) return "billing";
+  if (s.includes("max_output") || s.includes("max_tokens") || s.includes("output token") || s.includes("too long")) return "max_output";
+  return "other";
+}
+
+/**
+ * 是不是本机地址：主机名严格是 127.0.0.1、localhost、::1。只有本机地址才发明文附件
+ * @param {string} url @returns {boolean}
+ */
+export function isLocal(url) {
+  try {
+    return LOOPBACK.has(new URL(url).hostname);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 分享档位：设置里的 share 加上是不是本机。没设、或者设成 auto：本机 2（完整），非本机 1（概要）；认不出的值按 1
+ * @param {string | undefined} share @param {boolean} local @returns {Level}
+ */
+export function shareLevel(share, local) {
+  const v = (share || "").trim().toLowerCase();
+  if (!v || v === "auto" || v.startsWith("${")) return local ? 2 : 1;
+  if (v === "anonymous") return 0;
+  if (v === "full") return 2;
+  return 1;
+}
+
+/** @param {string} salt @param {string} value */
+export function hash16(salt, value) {
+  return createHash("sha256").update(salt + value).digest("hex").slice(0, 16);
+}
+
+/** 公开的星系编号 = sha256(secret) 的前 32 个十六进制字符 @param {string} secret */
+export function galaxyId(secret) {
+  return createHash("sha256").update(secret).digest("hex").slice(0, ID_HEX);
+}
+
+/** 项目目录哈希前统一大小写和分隔符 @param {string} dir */
+export function normDir(dir) {
+  return dir.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+}
+
+/** @param {unknown} v @returns {v is string} */
+const str = v => typeof v === "string" && v.length > 0;
+
+/** 太大时把长字符串截短（数组最多留 200 项） @param {unknown} v @param {number} n @returns {unknown} */
+export function clipDeep(v, n) {
+  if (typeof v === "string") return v.length > n ? v.slice(0, n) + `…(+${v.length - n})` : v;
+  if (Array.isArray(v)) return v.slice(0, 200).map(x => clipDeep(x, n));
+  if (v && typeof v === "object") return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, clipDeep(x, n)]));
+  return v;
+}
+
+const bytes = (/** @type {unknown} */ v) => Buffer.byteLength(JSON.stringify(v) ?? "", "utf8");
+
+// ---- 附件里的短字段：只负责挑字段和截断，不负责造句（句子由浏览器按看的人的语言拼）
+
+/** 东亚宽字符算 1，其余算 0.55（照搬 Python 版 humanize.py 的 char_width） @param {string} ch */
+const charW = ch => /[\u1100-\u115f\u2e80-\ua4cf\uac00-\ud7a3\uf900-\ufaff\ufe30-\ufe4f\uff00-\uff60\uffe0-\uffe6]|[\ud800-\udbff]/.test(ch) ? 1 : 0.55;
+/** @param {string} s */
+const textW = s => { let w = 0; for (const c of s) w += charW(c); return w; };
+/** 压掉空白，超出 n 个字符时截断加省略号 @param {unknown} v @param {number} n */
+export function clip(v, n) {
+  const s = typeof v === "string" ? v.replace(/\s+/g, " ").trim() : "";
+  return s.length > n ? s.slice(0, n - 1).trimEnd() + "…" : s;
+}
+/** 第一行非空的文字 @param {unknown} v */
+export function firstLine(v) {
+  if (typeof v !== "string") return "";
+  for (const line of v.trim().split(/\r?\n/)) if (line.trim()) return line.trim();
+  return "";
+}
+
+// 只在分句的标点处截断。括号、引号、书名号不算
+const PUNCT = new Set("，。！？；：、,!?;:");
+/** @param {string} t @param {number} i */
+function isBreak(t, i) {
+  const c = t[i];
+  if (c === ":") return i + 1 === t.length || t[i + 1] === " ";   // http://、C:\、12:30 里的冒号不算
+  if (PUNCT.has(c)) return true;
+  return c === "." && (i + 1 === t.length || t[i + 1] === " ");   // 英文句点只在句末算
+}
+
+/**
+ * 对话的标签：输入的第一句的开头，最多约 12 个汉字宽，在标点处截断。照搬 Python 版 humanize.py 的 label_from_prompt
+ * @param {unknown} text @param {number} [width] @returns {string}
+ */
+export function labelFromPrompt(text, width = 12) {
+  let t = (typeof text === "string" ? text : "").replace(/\[(Image #\d+|图片)\]/g, " ").replace(/\s+/g, " ").trim();
+  if (!t) return "";
+  // 先取第一个分句；太短的开头（「1.」「好的，」）认不出对话，跳过这个标点接着找
+  for (let i = 1; i < t.length; i++) if (isBreak(t, i) && textW(t.slice(0, i).trim()) >= 3) { t = t.slice(0, i); break; }
+  t = t.trim();
+  if (textW(t) <= width) return t;
+  // 还是太长：在宽度内最后一个空格处断开（英文），否则硬截
+  let w = 0, cut = "";
+  for (const c of t) { w += charW(c); if (w > width - 1) break; cut += c; }
+  const sp = cut.lastIndexOf(" ");
+  if (sp >= 4) cut = cut.slice(0, sp);
+  return cut.trimEnd() + "…";
+}
+
+/** 对话标签的宽度（汉字算 1，其余算 0.55） */
+export const LABEL_WIDTH = 20;
+
+/** 回答的最后一句（去掉 Markdown 记号） @param {unknown} text */
+export function lastSentence(text) {
+  if (typeof text !== "string") return "";
+  /** @type {string[]} */
+  const out = [];
+  for (let line of text.replace(/[`*#>\[\]]+/g, "").split(/\r?\n/)) {
+    line = line.replace(/^[\s\-•]+|[\s\-•]+$/g, "");
+    if (!line) continue;
+    for (const part of line.split(/(?<=[。！？!?])|(?<=\.)\s+/)) if (part.trim()) out.push(part.trim());
+  }
+  return out.length ? out[out.length - 1] : "";
+}
+
+/** 路径的最后两段：web/draw.ts @param {unknown} p */
+export function lastTwo(p) {
+  const parts = (typeof p === "string" ? p : "").split(/[\\/]+/).filter(Boolean);
+  const s = parts.slice(-2).join("/");
+  return s.length > 120 ? "…" + s.slice(-119) : s;   // 太长时留结尾：文件名比目录要紧
+}
+
+/**
+ * 一步的对象（照搬 Python 版 tool_phrase 取的东西，不带动词）。其余工具（含 MCP）没有对象：真实工具名已经够了
+ * @param {string} name @param {any} inp @returns {string}
+ */
+export function toolObj(name, inp) {
+  const i = inp && typeof inp === "object" ? inp : {};
+  switch (name) {
+    case "Bash": case "PowerShell": return clip(i.command, 60);
+    case "Read": case "Edit": case "MultiEdit": case "Write": return lastTwo(i.file_path);
+    case "NotebookEdit": return lastTwo(i.notebook_path || i.file_path);
+    case "Grep": case "Glob": return clip(i.pattern, 60);
+    case "WebFetch": try { return clip(new URL(String(i.url)).hostname, 120); } catch { return clip(i.url, 60); }
+    case "WebSearch": return clip(i.query, 60);
+    case "Agent": case "Task": return clip(firstLine(i.description) || i.subagent_type, 60);
+    case "AskUserQuestion": {
+      const q = Array.isArray(i.questions) && i.questions[0] && typeof i.questions[0] === "object" ? i.questions[0].question : "";
+      return clip(firstLine(q), 60);
+    }
+    case "Skill": return clip(i.skill || i.command, 60);
+    default: return "";
+  }
+}
+
+/** 去掉空字段；还超过上限就把最长的那个字段一截一截地剪短 @param {Detail} d @returns {Detail | null} */
+export function fitSmall(d) {
+  /** @type {Record<string, string>} */
+  const o = {};
+  for (const [k, v] of Object.entries(d)) if (typeof v === "string" && v) o[k] = v;
+  if (!Object.keys(o).length) return null;
+  for (let guard = 0; bytes(o) > SMALL_MAX_BYTES && guard < 200; guard++) {
+    const k = Object.keys(o).sort((a, b) => o[b].length - o[a].length)[0];
+    const s = o[k];
+    if (s.length <= 4) { delete o[k]; continue; }
+    o[k] = s.slice(0, Math.floor(s.length * 0.8)).trimEnd() + "…";
+  }
+  return Object.keys(o).length ? o : null;
+}
+
+/** 大附件：超过上限时把长字符串越截越短；还是太大就不发 @param {unknown} v @returns {unknown} */
+export function fitFull(v) {
+  if (v === undefined || v === null || v === "") return undefined;
+  if (bytes(v) <= FULL_MAX_BYTES) return v;
+  for (const n of [8000, 2000, 500, 120]) { const c = clipDeep(v, n); if (bytes(c) <= FULL_MAX_BYTES) return c; }
+  return undefined;
+}
+
+/** 通知、报错的文字：字符串原样，对象取 message @param {unknown} v @returns {string} */
+const textOf = v => typeof v === "string" ? v
+  : v && typeof v === "object" && typeof (/** @type {any} */ (v)).message === "string" ? /** @type {any} */ (v).message : "";
+
+/**
+ * 小附件（档位 1 起）
+ * @param {any} hook @param {string} name @param {{ me?: string, projectDir?: string, taskNote?: boolean }} ctx @returns {Detail | null}
+ */
+export function smallDetail(hook, name, ctx) {
+  switch (name) {
+    case "SessionStart": {
+      const dir = str(ctx.projectDir) ? ctx.projectDir : str(hook.cwd) ? hook.cwd : "";
+      return fitSmall({ me: clip(ctx.me, 40), proj: clip(lastTwo(dir).split("/").pop(), 80) });
+    }
+    // 宽度比 Python 版的 12 宽一些：它在这里还要当对话的标题；画面上放不下时浏览器会再截
+    case "UserPromptSubmit": return ctx.taskNote ? null : fitSmall({ label: labelFromPrompt(hook.prompt, LABEL_WIDTH) });
+    case "PreToolUse": case "PermissionRequest": {
+      const tn = str(hook.tool_name) ? hook.tool_name.slice(0, 160) : "";
+      return tn ? fitSmall({ name: tn, obj: toolObj(tn, hook.tool_input) }) : null;
+    }
+    case "PostToolUseFailure": return fitSmall({ err: clip(firstLine(textOf(hook.error)), 160) });
+    case "SubagentStart": return fitSmall({ type: clip(hook.agent_type, 80) });
+    case "Stop": return fitSmall({ say: clip(lastSentence(hook.last_assistant_message), 200) });
+    default: return null;
+  }
+}
+
+/**
+ * 大附件（档位 2）
+ * @param {any} hook @param {string} name @param {{ taskNote?: boolean }} ctx @returns {unknown}
+ */
+export function fullDetail(hook, name, ctx) {
+  switch (name) {
+    case "UserPromptSubmit": return ctx.taskNote ? undefined : fitFull(hook.prompt);
+    case "PreToolUse": case "PermissionRequest": return fitFull(hook.tool_input);
+    case "PostToolUse": {
+      let r = hook.tool_response;
+      // Edit、Write 的回应里有整份原文件：又大又和 tool_input 重复，不要
+      if (r && typeof r === "object" && !Array.isArray(r) && "originalFile" in r) { r = { ...r }; delete r.originalFile; }
+      return fitFull(r);
+    }
+    case "PostToolUseFailure": return fitFull(textOf(hook.error));
+    case "Notification": return fitFull(textOf(hook.message));
+    case "Stop": return fitFull(hook.last_assistant_message);
+    default: return undefined;
+  }
+}
+
+// ---- 加密
+
+/** base64url 编码 @param {Buffer} b */
+const b64u = b => b.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+
+/**
+ * 从邀请链接里的 K 派生出口令（发给服务器）和内容密钥（永不离开本机）。K 是 32 字节随机数的 base64url（43 个字符）。
+ * 星系群编号 = sha256(口令) 的前 32 个十六进制字符，服务器自己也这样算
+ * @param {string} k @returns {{ access: string, group: string, content: Buffer } | null}
+ */
+export function deriveKeys(k) {
+  if (typeof k !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(k)) return null;
+  const K = Buffer.from(k.replace(/-/g, "+").replace(/_/g, "/") + "=", "base64");
+  if (K.length !== 32) return null;
+  const hk = (/** @type {string} */ info) => Buffer.from(hkdfSync("sha256", K, Buffer.alloc(0), info, 32));
+  const access = b64u(hk("agent-loop/access/v1"));
+  return { access, group: createHash("sha256").update(access).digest("hex").slice(0, ID_HEX), content: hk("agent-loop/content/v1") };
+}
+
+/**
+ * AES-256-GCM 加密：base64url(12 字节随机数 ‖ 密文 ‖ 16 字节校验)。aad 是 协议版本|槽|sid|键
+ * @param {Buffer} key @param {unknown} value @param {string} aad
+ */
+export function seal(key, value, aad) {
+  const iv = randomBytes(12), c = createCipheriv("aes-256-gcm", key, iv);
+  c.setAAD(Buffer.from(aad, "utf8"));
+  return b64u(Buffer.concat([iv, c.update(JSON.stringify(value), "utf8"), c.final(), c.getAuthTag()]));
+}
+
+/**
+ * 一条事件的附件放进哪个槽、用什么键。和 shared/src/attach.ts 的 slotsOf 一致（test/plugin-sync.test.ts 检查）
+ * 名片（card）的附加校验数据里放星系编号 gid：服务器没法把你的名片挪到别人的星系上
+ * @param {{ ev: string, sid: string, proj: string, tool?: string, agent?: string, prompt?: string }} ev @param {string} [gid]
+ * @returns {{ small: { slot: string, sid: string, k: string } | null, full: { slot: string, sid: string, k: string } | null }}
+ */
+export function slotsOf(ev, gid = "") {
+  const sid = ev.sid, tool = ev.tool, pr = ev.prompt ?? "";
+  switch (ev.ev) {
+    case "SessionStart": return { small: { slot: "card", sid: gid, k: ev.proj }, full: null };
+    case "UserPromptSubmit": return { small: { slot: "ask", sid, k: pr }, full: { slot: "full-ask", sid, k: pr } };
+    case "PreToolUse": case "PermissionRequest":
+      return tool ? { small: { slot: "step", sid, k: tool }, full: { slot: "full-in", sid, k: tool } } : { small: null, full: null };
+    case "PostToolUse": return { small: null, full: tool ? { slot: "full-out", sid, k: tool } : null };
+    case "PostToolUseFailure":
+      return tool ? { small: { slot: "fail", sid, k: tool }, full: { slot: "full-out", sid, k: tool } } : { small: null, full: null };
+    case "SubagentStart": return { small: ev.agent ? { slot: "sub", sid, k: ev.agent } : null, full: null };
+    case "Notification": return { small: null, full: { slot: "full-note", sid, k: pr } };
+    case "Stop": return { small: { slot: "ans", sid, k: pr }, full: { slot: "full-ans", sid, k: pr } };
+    default: return { small: null, full: null };
+  }
+}
+/** 附加校验数据 @param {string} slot @param {string} sid @param {string} k */
+export const aadOf = (slot, sid, k) => `agent-loop/${PROTOCOL_VERSION}|${slot}|${sid}|${k}`;
+
+// ---- 模型名：hook 数据里没有（docs/step0-findings.md），从会话记录末尾最后一条回答里取
+
+/** @param {unknown} path @returns {string | undefined} */
+export function modelFromTranscript(path) {
+  if (!str(path)) return undefined;
+  /** @type {number | undefined} */
+  let fd;
+  try {
+    fd = openSync(/** @type {string} */ (path), "r");
+    const size = fstatSync(fd).size, n = Math.min(size, 64 * 1024), buf = Buffer.alloc(n);
+    readSync(fd, buf, 0, n, size - n);
+    const lines = buf.toString("utf8").split("\n");
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (!lines[i].includes('"assistant"')) continue;
+      try {
+        const o = JSON.parse(lines[i]);
+        const mdl = o && o.type === "assistant" && o.message && o.message.model;
+        if (typeof mdl === "string" && mdl.length <= 80 && MODEL_RE.test(mdl)) return mdl;
+      } catch { /* 第一行可能被截断了 */ }
+    }
+  } catch { /* 没有这个文件 */ } finally {
+    if (fd !== undefined) try { closeSync(fd); } catch { /* ignore */ }
+  }
+  return undefined;
+}
+
+// ---- token 数：hook 数据里也没有，从会话记录里读
+//
+// ctx：最后一次回答时的上下文大小（输入 + 缓存读 + 缓存写）；out：主对话所有回答的输出 token 加起来。
+// 同一条回答在记录里拆成好几条、每条带同一份 usage：按 message.id 只算一次。子 agent 的记录（isSidechain）不算。
+// 记录可能有几十 MB：记下读到了哪里（cacheFile），下次从那里接着读。
+
+const USAGE_CHUNK = 1 << 20;
+const MAX_TOK = 1e11;
+const tokN = (/** @type {unknown} */ v) => (typeof v === "number" && isFinite(v) && v > 0 ? Math.floor(v) : 0);
+
+/**
+ * @param {unknown} path @param {string} [cacheFile]
+ * @returns {{ ctx: number, out: number } | undefined}
+ */
+export function usageFromTranscript(path, cacheFile) {
+  if (!str(path)) return undefined;
+  /** @type {{ path: string, off: number, out: number, ctx: number, ids: string[] }} */
+  let st = { path: /** @type {string} */ (path), off: 0, out: 0, ctx: 0, ids: [] };
+  if (cacheFile) {
+    try {
+      const c = JSON.parse(readFileSync(cacheFile, "utf8"));
+      if (c && c.path === path && Number.isInteger(c.off) && c.off >= 0 && Array.isArray(c.ids)) st = { ...st, ...c, out: tokN(c.out), ctx: tokN(c.ctx) };
+    } catch { /* 第一次 */ }
+  }
+  /** @type {number | undefined} */
+  let fd;
+  const start = st.off;
+  try {
+    fd = openSync(/** @type {string} */ (path), "r");
+    const size = fstatSync(fd).size;
+    if (size < st.off) st = { ...st, off: 0, out: 0, ctx: 0, ids: [] };   // 文件被换掉了：从头读
+    const seen = new Set(st.ids);
+    let pos = st.off, rest = Buffer.alloc(0);
+    while (pos < size) {
+      const buf = Buffer.alloc(Math.min(USAGE_CHUNK, size - pos));
+      const n = readSync(fd, buf, 0, buf.length, pos);
+      if (n <= 0) break;
+      pos += n;
+      const data = rest.length ? Buffer.concat([rest, buf.subarray(0, n)]) : buf.subarray(0, n);
+      const nl = data.lastIndexOf(10);
+      if (nl < 0) { rest = data; continue; }
+      rest = Buffer.from(data.subarray(nl + 1));
+      st.off = pos - rest.length;   // 只算到最后一个换行：最后一行可能还没写完
+      for (const line of data.subarray(0, nl).toString("utf8").split("\n")) {
+        if (!line.includes('"usage"') || !line.includes('"assistant"')) continue;
+        let o;
+        try { o = JSON.parse(line); } catch { continue; }
+        const m = o && o.type === "assistant" && !o.isSidechain && o.message;
+        const u = m && m.usage;
+        if (!u || typeof u !== "object") continue;
+        const ctx = tokN(u.input_tokens) + tokN(u.cache_read_input_tokens) + tokN(u.cache_creation_input_tokens);
+        if (ctx) st.ctx = Math.min(MAX_TOK, ctx);
+        const id = str(m.id) ? m.id : "";
+        if (id && seen.has(id)) continue;
+        if (id) { seen.add(id); st.ids.push(id); if (st.ids.length > 32) st.ids.shift(); }
+        st.out = Math.min(MAX_TOK, st.out + tokN(u.output_tokens));
+      }
+    }
+  } catch { return undefined; /* 没有这个文件 */ } finally {
+    if (fd !== undefined) try { closeSync(fd); } catch { /* ignore */ }
+  }
+  if (cacheFile && st.off !== start) {
+    try {
+      const tmp = `${cacheFile}.${process.pid}.tmp`;
+      writeFileSync(tmp, JSON.stringify(st), { mode: 0o600 });
+      renameSync(tmp, cacheFile);
+    } catch { /* 写不了：下次从头读 */ }
+  }
+  return st.ctx || st.out ? { ctx: st.ctx, out: st.out } : undefined;
+}
+
+/** 读到哪里的记录：数据目录下 usage/<哈希后的会话编号>.json，只在本机 @param {string} dir @param {string} sid */
+function usageCacheFile(dir, sid) {
+  const d = join(dir, "usage");
+  try { mkdirSync(d, { recursive: true }); } catch { /* ignore */ }
+  return join(d, `${sid}.json`);
+}
+
+/** 删掉 30 天没动过的：会话结束不删（--resume 沿用原来的会话编号） @param {string} dir */
+function pruneUsageCache(dir) {
+  const d = join(dir, "usage"), old = Date.now() - 30 * 86400_000;
+  try {
+    for (const f of readdirSync(d)) {
+      try { if (statSync(join(d, f)).mtimeMs < old) unlinkSync(join(d, f)); } catch { /* ignore */ }
+    }
+  } catch { /* 还没有 */ }
+}
+
+/**
+ * 从原始 hook 数据挑出允许的字段，重新拼一条事件。返回 null 表示这条不发。
+ * 这是白名单：下面没写到的字段一律不出去，Claude Code 以后新增的字段默认也不会被传出去。
+ * 附件按档位附上：本机是明文（detail、detail_full），非本机用 ctx.key 加密（enc、enc_full），没有 key 就不附。
+ * @param {any} hook 原始 hook 数据
+ * @param {{ salt: string, level: Level, local?: boolean, key?: Buffer, gid?: string, me?: string, projectDir?: string, now?: number,
+ *           readModel?: (path: unknown) => string | undefined,
+ *           readUsage?: (path: unknown, sid: string) => { ctx: number, out: number } | undefined }} ctx
+ * @returns {OutEvent | null}
+ */
+export function buildEvent(hook, ctx) {
+  if (!hook || typeof hook !== "object") return null;
+  const name = hook.hook_event_name;
+  if (!EVENT_NAMES.includes(name) || !str(hook.session_id)) return null;
+  const H = (/** @type {string} */ v) => hash16(ctx.salt, v);
+  const dir = str(ctx.projectDir) ? ctx.projectDir : str(hook.cwd) ? hook.cwd : "";
+
+  /** @type {OutEvent} */
+  const out = {
+    v: PROTOCOL_VERSION, level: ctx.level, ev: name, ts: Math.floor(ctx.now ?? Date.now()),
+    sid: H(hook.session_id), proj: H(normDir(dir)),
+  };
+  if (str(hook.agent_id)) out.agent = H(hook.agent_id);
+  if (str(hook.prompt_id)) out.prompt = H(hook.prompt_id);
+  if (str(hook.tool_use_id)) out.tool = H(hook.tool_use_id);
+  if (TOOL_EVENTS.has(name)) out.kind = toolKind(hook.tool_name);
+  if ((name === "PostToolUse" || name === "PostToolUseFailure") && typeof hook.duration_ms === "number"
+      && isFinite(hook.duration_ms) && hook.duration_ms >= 0) out.duration_ms = Math.min(1e9, Math.round(hook.duration_ms));
+  if (name === "PostToolUseFailure" && hook.is_interrupt === true) out.interrupt = true;
+  if (name === "SessionStart" && SESSION_SOURCES.includes(hook.source)) out.source = hook.source;
+  if (name === "SessionStart" || name === "Stop") {
+    if (typeof hook.model === "string" && hook.model.length <= 80 && MODEL_RE.test(hook.model)) out.model = hook.model;
+    else if (ctx.readModel) { const mdl = ctx.readModel(hook.transcript_path); if (mdl) out.model = mdl; }
+  }
+  if ((name === "SessionStart" || name === "Stop" || name === "PostToolBatch") && !out.agent && ctx.readUsage) {
+    // token 数：只是两个数，和模型名一样原样发
+    const u = ctx.readUsage(hook.transcript_path, out.sid);
+    if (u) { if (u.ctx) out.ctx_tok = u.ctx; if (u.out) out.out_tok = u.out; }
+  }
+  if (name === "Notification" && NOTIFICATION_TYPES.includes(hook.notification_type)) out.ntype = hook.notification_type;
+  if (name === "Stop") out.bg = Array.isArray(hook.background_tasks) ? Math.min(1000, hook.background_tasks.length) : 0;
+  if (name === "StopFailure") out.err_kind = errorKind(hook.error);
+  if (name === "SubagentStart" || name === "SubagentStop") {
+    const t = str(hook.agent_type) ? hook.agent_type : "";
+    if (t) {
+      out.agent_type = BUILTIN_AGENT_TYPES.includes(t) ? t : "custom";
+      out.agent_type_h = H("agent-type:" + t);
+    }
+  }
+  if (name === "PreToolUse" && out.kind === "agent" && !out.agent) {
+    // 派子 agent：对要派的类型算同样的哈希，服务器用它把起来的子 agent 配对到这一次派遣上。没写类型就是 general-purpose
+    const inp = hook.tool_input && typeof hook.tool_input === "object" ? hook.tool_input : {};
+    const t = str(inp.subagent_type) ? inp.subagent_type : "general-purpose";
+    out.agent_type = BUILTIN_AGENT_TYPES.includes(t) ? t : "custom";
+    out.agent_type_h = H("agent-type:" + t);
+  }
+  if (name === "UserPromptSubmit") {
+    // 输入的话只留一个布尔值：是不是后台任务（或后台子 agent）跑完的通知
+    const p = typeof hook.prompt === "string" ? hook.prompt.trimStart() : "";
+    out.task_note = p.startsWith("<task-notification") || p.startsWith("<agent-message");
+  }
+  // ---- 附件
+  if (ctx.level >= 1 && (ctx.local || ctx.key)) {
+    const dctx = { me: ctx.me, projectDir: ctx.projectDir, taskNote: out.task_note === true };
+    const slots = slotsOf(out, ctx.gid);
+    const small = slots.small ? smallDetail(hook, name, dctx) : null;
+    const full = ctx.level >= 2 && slots.full ? fullDetail(hook, name, dctx) : undefined;
+    if (ctx.local) {
+      if (small) out.detail = small;
+      if (full !== undefined) out.detail_full = full;
+    } else if (ctx.key) {
+      if (small && slots.small) out.enc = seal(ctx.key, small, aadOf(slots.small.slot, slots.small.sid, slots.small.k));
+      if (full !== undefined && slots.full) out.enc_full = seal(ctx.key, full, aadOf(slots.full.slot, slots.full.sid, slots.full.k));
+    }
+    // 每次提问补发名片（和 SessionStart 的小附件同一个槽、同样的内容）：会话开始那条事件没送到时
+    // （服务器重启过、会话中途才设好插件），项目名和星系名靠它补上。子 agent 的事件不带
+    if (name === "UserPromptSubmit" && !out.agent) {
+      const card = smallDetail(hook, "SessionStart", dctx);
+      if (card && ctx.local) out.card = card;
+      else if (card && ctx.key) out.enc_card = seal(ctx.key, card, aadOf("card", ctx.gid ?? "", out.proj));
+    }
+  }
+  if (ctx.local && ctx.level === 2) {
+    const text = JSON.stringify(hook);
+    out.raw = text.length > RAW_MAX_BYTES ? clipDeep(hook, 2000) : hook;
+  }
+  return out;
+}
+
+// ---- 身份
+
+/**
+ * 第一次运行时生成安装密钥和本机的盐。同时触发的几个 hook 进程可能一起来建：
+ * 先写临时文件再用硬链接放到位（已存在就失败），保证谁也读不到写了一半的文件。
+ * @param {string} dir
+ * @returns {{ secret: string, salt: string }}
+ */
+export function loadIdentity(dir) {
+  const file = join(dir, "identity.json");
+  const read = () => {
+    const d = JSON.parse(readFileSync(file, "utf8"));
+    if (!/^[0-9a-f]{64}$/.test(d.secret) || !/^[0-9a-f]{32}$/.test(d.salt)) throw new Error("bad identity");
+    return { secret: d.secret, salt: d.salt };
+  };
+  try { return read(); } catch { /* 还没有，或者正被别人写 */ }
+  mkdirSync(dir, { recursive: true });
+  const fresh = { secret: randomBytes(32).toString("hex"), salt: randomBytes(16).toString("hex") };
+  const body = JSON.stringify(fresh) + "\n";
+  const tmp = `${file}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
+  try {
+    writeFileSync(tmp, body, { mode: 0o600 });
+    try {
+      linkSync(tmp, file);
+      return fresh;
+    } catch (e) {
+      if (/** @type {any} */ (e).code !== "EEXIST") {
+        // 文件系统不支持硬链接：退回独占创建
+        try {
+          const fd = openSync(file, "wx", 0o600);
+          writeSync(fd, body); closeSync(fd);
+          return fresh;
+        } catch { /* 别人先建好了 */ }
+      }
+    }
+  } finally {
+    try { unlinkSync(tmp); } catch { /* ignore */ }
+  }
+  // 别人先建好了：读它的。独占创建的那条路可能还没写完，稍等再读
+  for (let i = 0; i < 20; i++) {
+    try { return read(); } catch { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25); }
+  }
+  return read();
+}
+
+export function dataDir() {
+  return process.env.CLAUDE_PLUGIN_DATA || join(homedir(), ".claude", "plugins", "data", "agent-loop");
+}
+
+/**
+ * 插件设置。Claude Code 以 CLAUDE_PLUGIN_OPTION_<KEY> 传进来；没设过时什么都不传（docs/step0-findings.md 第 7 项）。
+ *   server_url：本机地址，或者一条邀请链接（https://<服务器>/#k=<K>）
+ *   share：auto（默认）、anonymous、summary、full
+ *   name：星系的名字，空着就用自动生成的星表编号
+ * @param {Record<string, string | undefined>} [env]
+ */
+export function settings(env = process.env) {
+  const opt = (/** @type {string} */ k) => { const v = (env[`CLAUDE_PLUGIN_OPTION_${k}`] || "").trim(); return v && !v.startsWith("${") ? v : ""; };
+  return { target: parseTarget(opt("SERVER_URL")), share: opt("SHARE"), me: opt("NAME").slice(0, 40) };
+}
+
+/**
+ * 把 server_url 拆成服务器地址和邀请链接里的 K。#k= 之后的部分只在本机用，不会发给服务器
+ * @param {string} v @returns {{ url: string, k: string | null }}
+ */
+export function parseTarget(v) {
+  const raw = (v || "").trim() || DEFAULT_SERVER_URL;
+  const hash = raw.indexOf("#");
+  const base = (hash >= 0 ? raw.slice(0, hash) : raw).replace(/\/+$/, "");
+  const m = hash >= 0 ? /(?:^|[#&])k=([A-Za-z0-9_-]+)/.exec(raw.slice(hash)) : null;
+  return { url: base || DEFAULT_SERVER_URL, k: m ? m[1] : null };
+}
+
+/** userConfig 的 server_url 里的服务器地址（不含 #k=）；没设过就用默认的本机地址 */
+export function serverUrl(env = process.env) {
+  return settings(env).target.url;
+}
+
+/**
+ * 记下最近一次用的 server_url，给 /galaxy 用：server_url 是敏感设置（邀请链接里有密钥），存在系统的凭据存储里，
+ * 命令正文里拿不到（docs/step0-findings.md）。文件在插件数据目录里，权限 0600，和安装密钥放在一起。变了才写
+ * @param {string} dir @param {string} value
+ */
+export function rememberTarget(dir, value) {
+  const file = join(dir, "server.json");
+  try { if (JSON.parse(readFileSync(file, "utf8")).server_url === value) return; } catch { /* 还没有 */ }
+  try {
+    mkdirSync(dir, { recursive: true });
+    const tmp = `${file}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify({ server_url: value }) + "\n", { mode: 0o600 });
+    renameSync(tmp, file);
+  } catch { /* 写不了：/galaxy 退回默认地址 */ }
+}
+
+/** @param {string} dir @returns {string} */
+function rememberedTarget(dir) {
+  try { const v = JSON.parse(readFileSync(join(dir, "server.json"), "utf8")).server_url; return typeof v === "string" ? v : ""; } catch { return ""; }
+}
+
+// ---- 上报不出去时告诉用户
+//
+// 异步 hook 失败时 Claude Code 什么都不显示（docs/step0-findings.md），设错了 server_url 的人只会觉得「装了没用」。
+// 所以每次发送后把结果记进 status.json（变了才写），会话开始时检查设置和上次的结果，有问题就在 Claude Code 里提示一行。
+
+/**
+ * 记下这次发送的结果。status：HTTP 状态码，或者 "unreachable"（连不上、超时）
+ * @param {string} dir @param {string} url 服务器地址（不含 #k=） @param {number | "unreachable"} status
+ */
+export function recordStatus(dir, url, status) {
+  const file = join(dir, "status.json");
+  try { const d = JSON.parse(readFileSync(file, "utf8")); if (d.url === url && d.status === status) return; } catch { /* 还没有 */ }
+  try {
+    mkdirSync(dir, { recursive: true });
+    const tmp = `${file}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify({ url, status }) + "\n", { mode: 0o600 });
+    renameSync(tmp, file);
+  } catch { /* 写不了就算了 */ }
+}
+
+/** @param {string} dir @returns {{ url: string, status: number | "unreachable" } | null} */
+export function lastStatus(dir) {
+  try {
+    const d = JSON.parse(readFileSync(join(dir, "status.json"), "utf8"));
+    return typeof d.url === "string" && (typeof d.status === "number" || d.status === "unreachable") ? d : null;
+  } catch { return null; }
+}
+
+/** 插件要的最低 Node 版本（自带的 fetch、AbortSignal.timeout） */
+export const MIN_NODE = 18;
+/**
+ * Node 太旧：fetch 不存在，每次发送都会失败，却会被记成「连不上服务器」。会话开始时直接说清楚
+ * @param {string} version process.versions.node @returns {string | null}
+ */
+export function nodeProblem(version) {
+  const major = Number(String(version).split(".")[0]);
+  return major >= MIN_NODE ? null : `Agent Loop is not reporting: it needs Node.js ${MIN_NODE} or newer, but \`node\` here is ${version}. Install a newer Node.js, then start a new session.`;
+}
+
+/** server_url 是不是以 http:// 或 https:// 开头 @param {string} url */
+export const hasScheme = url => /^https?:\/\//i.test(url);
+
+/**
+ * 设置或者上次的发送有没有问题。没问题返回 null；有问题返回给用户看的一行字（英文，和插件别的输出一样）。
+ * 这行字会显示在 Claude Code 里，也可能进对话：不能带密钥
+ * @param {{ url: string, k: string | null }} target @param {{ url: string, status: number | "unreachable" } | null} last
+ */
+export function reportProblem(target, last) {
+  const { url, k } = target;
+  const fix = "Paste the whole invite link (…/#k=…) into the Agent Loop plugin's server_url setting, then run /reload-plugins.";
+  // 漏了 http://：不替人补（补错成 http:// 会把口令明文发出去），照实说
+  if (!hasScheme(url)) return `Agent Loop is not reporting: server_url must start with http:// or https:// (it is "${url}"). ${fix}`;
+  if (!isLocal(url)) {
+    if (!k) return `Agent Loop is not reporting: server_url points to ${url} but has no group key. ${fix}`;
+    if (!deriveKeys(k)) return `Agent Loop is not reporting: the invite link in server_url is incomplete (the key after #k= must be 43 characters). ${fix}`;
+  }
+  // 上次的结果只对同一个地址算数：换过地址就等下一次发送
+  if (!last || last.url !== url) return null;
+  const s = last.status;
+  if (s === "unreachable") {
+    return isLocal(url)
+      ? `Agent Loop could not reach ${url} last time. To watch on this computer, run \`npx agent-loop\`. To join a galaxy group instead, paste its invite link (…/#k=…) into the plugin's server_url setting.`
+      : `Agent Loop could not reach ${url} last time. Check that the server is running and reachable from this computer.`;
+  }
+  if (s === 401 || s === 403) return `Agent Loop: ${url} refused the reports (HTTP ${s}). The invite link may be wrong, or this server only accepts certain galaxy groups. ${fix}`;
+  if (s === 400) return `Agent Loop: ${url} rejected the reports (HTTP 400). The plugin and the server may be different versions: update the plugin.`;
+  return null;
+}
+
+// ---- 发送
+
+/**
+ * @param {string} url @param {string} secret @param {OutEvent} ev @param {number} timeoutMs @param {string} [access] 星系群的口令
+ */
+export async function send(url, secret, ev, timeoutMs, access) {
+  /** @type {Record<string, string>} */
+  const headers = { "content-type": "application/json", authorization: `Bearer ${secret}`, "x-agent-loop-plugin": PLUGIN_VERSION };
+  if (access) headers["x-group"] = access;
+  const res = await fetch(url + "/v1/events", {
+    method: "POST", headers, body: JSON.stringify(ev), signal: AbortSignal.timeout(timeoutMs),
+  });
+  await res.arrayBuffer().catch(() => {});
+  return res.status;
+}
+
+async function readStdin() {
+  /** @type {Buffer[]} */
+  const chunks = [];
+  for await (const c of process.stdin) chunks.push(/** @type {Buffer} */ (c));
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+/**
+ * 「我的星系」的网址。带着邀请链接的密钥（#k=）时，这条网址发给别人就等于邀请对方
+ * @param {string} dir 插件数据目录 @param {string} serverUrlValue server_url 的值（可能是邀请链接）
+ * @param {boolean} [withKey] 带不带密钥
+ */
+export function galaxyUrl(dir, serverUrlValue, withKey = true) {
+  const { url, k } = parseTarget(serverUrlValue);
+  const id = galaxyId(loadIdentity(dir).secret);
+  // &mine：告诉页面这是你自己的星系（别人发来的 #g= 链接没有它，不会被当成你的）
+  return `${url}/#${k && withKey ? `k=${k}&` : ""}g=${id}&mine`;
+}
+
+/** 用系统的浏览器打开网址（参数直接传给程序，不经过 shell）。失败就算了 @param {string} url */
+function openBrowser(url) {
+  try {
+    const [cmd, args] = process.platform === "win32" ? ["explorer.exe", [url]] : process.platform === "darwin" ? ["open", [url]] : ["xdg-open", [url]];
+    spawn(cmd, args, { detached: true, stdio: "ignore" }).on("error", () => {}).unref();
+    return true;
+  } catch { return false; }
+}
+
+async function main() {
+  const args = process.argv.slice(2);
+  if (args[0] === "--galaxy") {
+    // /galaxy 命令：命令里的 shell 拿不到插件的环境变量，所以数据目录从参数传进来；地址从 hook 记下的 server.json 读
+    const dir = args[1] && !args[1].startsWith("${") ? args[1] : dataDir();
+    const given = args[2] && !args[2].startsWith("${") ? args[2] : "";
+    const target = given || rememberedTarget(dir) || serverUrl();
+    // 命令的输出会进对话、发给模型：密钥不能出现在这里。带密钥的网址直接交给浏览器打开
+    let out = galaxyUrl(dir, target, false);
+    if (parseTarget(target).k && !args.includes("--no-open") && openBrowser(galaxyUrl(dir, target, true))) {
+      out += "\n(opened in your browser with the group key; the key is not shown here)";
+    }
+    const problem = nodeProblem(process.versions.node) ?? reportProblem(parseTarget(target), lastStatus(dir));
+    if (problem) out += `\nProblem: ${problem}`;
+    await new Promise(r => process.stdout.write(out + "\n", () => r(undefined)));
+    return;
+  }
+  const text = await readStdin();
+  const hook = JSON.parse(text);
+  const { target, share, me } = settings();
+  if (args[0] === "--check") {
+    // 会话开始时的同步检查（hooks.json 里 SessionStart 的第二个 hook）：只读设置和 status.json，不连网络，不拖慢启动。
+    // 异步 hook 的 systemMessage 不会显示给用户，所以这一步必须是同步的。压缩上下文时不重复提示
+    if (hook.source === "compact") return;
+    const problem = nodeProblem(process.versions.node) ?? reportProblem(target, lastStatus(dataDir()));
+    if (problem) await new Promise(r => process.stdout.write(JSON.stringify({ systemMessage: problem }) + "\n", () => r(undefined)));
+    return;
+  }
+  const local = isLocal(target.url);
+  const keys = target.k ? deriveKeys(target.k) : null;
+  const dir = dataDir();
+  const value = (process.env.CLAUDE_PLUGIN_OPTION_SERVER_URL || "").trim();
+  // 地址漏了 http://，或者发往别处却没有邀请链接（或者链接坏了）：什么都不发。会话开始时的检查会告诉用户。
+  // 这时只在还没记过地址时记一下（新用户设错了，/galaxy 也能照实说出问题）；记过就不动：
+  // 改设置以前开的会话还拿着旧值，不能让它把新会话记下的好地址冲掉
+  if (!hasScheme(target.url) || (!local && !keys)) { if (!rememberedTarget(dir)) rememberTarget(dir, value); return; }
+  rememberTarget(dir, value);
+  const { secret, salt } = loadIdentity(dir);
+  const ev = buildEvent(hook, {
+    salt, level: shareLevel(share, local), local, key: keys?.content, gid: galaxyId(secret), me,
+    projectDir: process.env.CLAUDE_PROJECT_DIR, readModel: modelFromTranscript,
+    readUsage: (p, sid) => usageFromTranscript(p, usageCacheFile(dir, sid)),
+  });
+  if (!ev) return;
+  if (ev.ev === "SessionStart" && ev.source === "startup") pruneUsageCache(dir);
+  // SessionEnd 的发送超时很短，超时不代表服务器有问题：它的结果不记
+  if (ev.ev === "SessionEnd") return void await send(target.url, secret, ev, SESSION_END_TIMEOUT_MS, keys?.access);
+  /** @type {number | "unreachable"} */
+  let status;
+  try { status = await send(target.url, secret, ev, SEND_TIMEOUT_MS, keys?.access); } catch { status = "unreachable"; }
+  recordStatus(dir, target.url, status);
+}
+
+const isMain = (() => {
+  try { return !!process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href; } catch { return false; }
+})();
+if (isMain) {
+  process.on("uncaughtException", () => { process.exit(0); });
+  process.on("unhandledRejection", () => { process.exit(0); });
+  // 发完（或失败）就立刻退出：发送超时以后，没连上的 TCP 连接还会让进程多挂一两秒（Windows 上连被拒绝的端口会重试），
+  // 同步的 SessionEnd 会因此被 Claude Code 取消
+  main().catch(() => {}).finally(() => process.exit(0));
+}
