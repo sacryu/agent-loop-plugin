@@ -41,7 +41,7 @@ The only script that sends anything is [`plugin/hooks/report.mjs`](plugin/hooks/
 
 | `share` | Sent |
 |---|---|
-| `anonymous` | Only event categories and timings: when you work, how many sessions, which **kind** of tool each step used, how long it took. IDs are salted hashes; the salt never leaves your computer |
+| `anonymous` | Only event categories and timings: when you work, how many sessions, which **kind** of tool each step used, how long it took, the model name, and running totals of laps, steps and tokens (counted from the local transcript). IDs are salted hashes; the salt never leaves your computer |
 | `summary` | Plus: galaxy name, project folder name, session title (the one Claude Code generates, read from the local transcript), each step's tool and target (file name, start of the command, search term), first line of errors, last sentence of each answer |
 | `full` | Plus: your full prompts, complete tool input and output, complete answers and errors |
 

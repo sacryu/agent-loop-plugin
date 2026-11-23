@@ -29,7 +29,7 @@ export const DEFAULT_SERVER_URL = "http://127.0.0.1:4317";
 export const PROTOCOL_VERSION = 2;
 /** 插件自己的版本，每次上报放在请求头 x-agent-loop-plugin 里，页面据此提示更新。
  *  和 plugin.json 的 version、shared/src/version.ts 的 PLUGIN_VERSION 一致（测试检查） */
-export const PLUGIN_VERSION = "0.2.5";
+export const PLUGIN_VERSION = "0.2.6";
 export const SEND_TIMEOUT_MS = 2000;
 /** SessionEnd 是同步 hook（会话退出时异步进程会被杀掉，见 docs/step0-findings.md）。Claude Code 给 SessionEnd 的
  *  总时间约 1.5 秒，超过就取消并在终端打一行提示；Node 启动的时间也算在里面，所以发送超时要短 */
@@ -86,7 +86,7 @@ const LOOPBACK = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
  *   v: 2, level: Level, ev: string, ts: number, sid: string, proj: string,
  *   agent?: string, prompt?: string, tool?: string, kind?: ToolKind, duration_ms?: number,
  *   interrupt?: boolean, source?: string, ntype?: string, bg?: number, err_kind?: ErrKind,
- *   agent_type?: string, agent_type_h?: string, task_note?: boolean, model?: string, ctx_tok?: number, out_tok?: number,
+ *   agent_type?: string, agent_type_h?: string, task_note?: boolean, model?: string, ctx_tok?: number, out_tok?: number, laps?: number, steps?: number,
  *   detail?: Detail, detail_full?: unknown, enc?: string, enc_full?: string, card?: Detail, enc_card?: string,
  *   title?: Detail, enc_title?: string, raw?: unknown
  * }} OutEvent
@@ -422,6 +422,8 @@ export function modelFromTranscript(path) {
 // 同一条回答在记录里拆成好几条、每条带同一份 usage：按 message.id 只算一次。子 agent 的记录（isSidechain）不算。
 // 标题：Claude Code 自己给对话起的（type "ai-title" 的行，第一句话发出后几秒才写进去，之后隔一阵重写一遍）；
 // 用 /rename 改过的（type "custom-title"）优先。
+// laps：主对话回答了几次（按 message.id 数，Claude Code 自己补的 <synthetic> 回答不算），一次回答就是一圈；
+// steps：主对话调用了几次工具（tool_use）。服务器重启过、会话中途才接上时，页面上的累计圈数、步数靠这两个数补回来。
 // 记录可能有几十 MB：记下读到了哪里（cacheFile），下次从那里接着读。
 
 const USAGE_CHUNK = 1 << 20;
@@ -429,22 +431,23 @@ const MAX_TOK = 1e11;
 const tokN = (/** @type {unknown} */ v) => (typeof v === "number" && isFinite(v) && v > 0 ? Math.floor(v) : 0);
 
 const TITLE_MAX = 80;
-const USAGE_CACHE_V = 2;   // 缓存里加了标题：旧的缓存从头再读一遍，不然已经读过去的标题就拿不到了
+const USAGE_CACHE_V = 3;   // 缓存里加了东西（2：标题，3：圈数、步数）：旧的缓存从头再读一遍，不然已经读过去的就数不到了
 
 /**
  * @param {unknown} path @param {string} [cacheFile]
- * @returns {{ ctx: number, out: number, title?: string, titleNew?: true } | undefined}
+ * @returns {{ ctx: number, out: number, laps: number, steps: number, title?: string, titleNew?: true } | undefined}
  *   titleNew：这次读到的标题和上次读到的不一样（包括第一次读到）
  */
 export function usageFromTranscript(path, cacheFile) {
   if (!str(path)) return undefined;
-  /** @type {{ v: number, path: string, off: number, out: number, ctx: number, ids: string[], ai: string, custom: string }} */
-  let st = { v: USAGE_CACHE_V, path: /** @type {string} */ (path), off: 0, out: 0, ctx: 0, ids: [], ai: "", custom: "" };
+  /** @type {{ v: number, path: string, off: number, out: number, ctx: number, ids: string[], laps: number, steps: number, tools: string[], ai: string, custom: string }} */
+  let st = { v: USAGE_CACHE_V, path: /** @type {string} */ (path), off: 0, out: 0, ctx: 0, ids: [], laps: 0, steps: 0, tools: [], ai: "", custom: "" };
   if (cacheFile) {
     try {
       const c = JSON.parse(readFileSync(cacheFile, "utf8"));
-      if (c && c.v === USAGE_CACHE_V && c.path === path && Number.isInteger(c.off) && c.off >= 0 && Array.isArray(c.ids)) {
-        st = { ...st, ...c, out: tokN(c.out), ctx: tokN(c.ctx), ai: str(c.ai) ? c.ai : "", custom: str(c.custom) ? c.custom : "" };
+      if (c && c.v === USAGE_CACHE_V && c.path === path && Number.isInteger(c.off) && c.off >= 0 && Array.isArray(c.ids) && Array.isArray(c.tools)) {
+        st = { ...st, ...c, out: tokN(c.out), ctx: tokN(c.ctx), laps: tokN(c.laps), steps: tokN(c.steps),
+               ai: str(c.ai) ? c.ai : "", custom: str(c.custom) ? c.custom : "" };
       }
     } catch { /* 第一次 */ }
   }
@@ -455,8 +458,8 @@ export function usageFromTranscript(path, cacheFile) {
   try {
     fd = openSync(/** @type {string} */ (path), "r");
     const size = fstatSync(fd).size;
-    if (size < st.off) st = { ...st, off: 0, out: 0, ctx: 0, ids: [], ai: "", custom: "" };   // 文件被换掉了：从头读
-    const seen = new Set(st.ids);
+    if (size < st.off) st = { ...st, off: 0, out: 0, ctx: 0, ids: [], laps: 0, steps: 0, tools: [], ai: "", custom: "" };   // 文件被换掉了：从头读
+    const seen = new Set(st.ids), seenTools = new Set(st.tools);
     let pos = st.off, rest = Buffer.alloc(0);
     while (pos < size) {
       const buf = Buffer.alloc(Math.min(USAGE_CHUNK, size - pos));
@@ -484,9 +487,21 @@ export function usageFromTranscript(path, cacheFile) {
         if (!u || typeof u !== "object") continue;
         const ctx = tokN(u.input_tokens) + tokN(u.cache_read_input_tokens) + tokN(u.cache_creation_input_tokens);
         if (ctx) st.ctx = Math.min(MAX_TOK, ctx);
+        const real = m.model !== "<synthetic>";
+        // 同一条回答拆成好几行，每行一块内容：工具调用按它自己的编号数
+        if (real && Array.isArray(m.content)) {
+          for (const b of m.content) {
+            if (!b || b.type !== "tool_use") continue;
+            const tid = str(b.id) ? b.id : "";
+            if (tid && seenTools.has(tid)) continue;
+            if (tid) { seenTools.add(tid); st.tools.push(tid); if (st.tools.length > 64) st.tools.shift(); }
+            st.steps += 1;
+          }
+        }
         const id = str(m.id) ? m.id : "";
         if (id && seen.has(id)) continue;
         if (id) { seen.add(id); st.ids.push(id); if (st.ids.length > 32) st.ids.shift(); }
+        if (real) st.laps += 1;
         st.out = Math.min(MAX_TOK, st.out + tokN(u.output_tokens));
       }
     }
@@ -501,8 +516,8 @@ export function usageFromTranscript(path, cacheFile) {
     } catch { /* 写不了：下次从头读 */ }
   }
   const title = st.custom || st.ai;
-  if (!st.ctx && !st.out && !title) return undefined;
-  return { ctx: st.ctx, out: st.out, ...(title ? { title } : {}), ...(title && title !== titleBefore ? { titleNew: /** @type {true} */ (true) } : {}) };
+  if (!st.ctx && !st.out && !st.laps && !title) return undefined;
+  return { ctx: st.ctx, out: st.out, laps: st.laps, steps: st.steps, ...(title ? { title } : {}), ...(title && title !== titleBefore ? { titleNew: /** @type {true} */ (true) } : {}) };
 }
 
 /** 读到哪里的记录：数据目录下 usage/<哈希后的会话编号>.json，只在本机 @param {string} dir @param {string} sid */
@@ -529,7 +544,7 @@ function pruneUsageCache(dir) {
  * @param {any} hook 原始 hook 数据
  * @param {{ salt: string, level: Level, local?: boolean, key?: Buffer, gid?: string, me?: string, projectDir?: string, now?: number,
  *           readModel?: (path: unknown) => string | undefined,
- *           readUsage?: (path: unknown, sid: string) => { ctx: number, out: number, title?: string, titleNew?: true } | undefined }} ctx
+ *           readUsage?: (path: unknown, sid: string) => { ctx: number, out: number, laps?: number, steps?: number, title?: string, titleNew?: true } | undefined }} ctx
  * @returns {OutEvent | null}
  */
 export function buildEvent(hook, ctx) {
@@ -562,6 +577,8 @@ export function buildEvent(hook, ctx) {
     const u = ctx.readUsage(hook.transcript_path, out.sid);
     // token 数：只是两个数，和模型名一样原样发
     if (u && name !== "UserPromptSubmit") { if (u.ctx) out.ctx_tok = u.ctx; if (u.out) out.out_tok = u.out; }
+    // 记录里已有的圈数、步数：也只是两个数。每圈结束时不带（那时记录里有正在跑的这一圈，服务器只在没有圈在跑时用它）
+    if (u && name !== "PostToolBatch") { if (u.laps) out.laps = u.laps; if (u.steps) out.steps = u.steps; }
     // 标题：会话开始、每次提问、每次回答完都带上（服务器重启过也能补回来）；每一圈结束时只在它变了的时候带
     if (u && u.title && (name !== "PostToolBatch" || u.titleNew)) title = u.title;
   }
