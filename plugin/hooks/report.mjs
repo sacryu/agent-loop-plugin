@@ -31,7 +31,7 @@ export const DEFAULT_SERVER_URL = "http://127.0.0.1:4317";
 export const PROTOCOL_VERSION = 2;
 /** 插件自己的版本，每次上报放在请求头 x-agent-loop-plugin 里，页面据此提示更新。
  *  和 plugin.json 的 version、shared/src/version.ts 的 PLUGIN_VERSION 一致（测试检查） */
-export const PLUGIN_VERSION = "0.2.9";
+export const PLUGIN_VERSION = "0.2.10";
 export const SEND_TIMEOUT_MS = 2000;
 /** SessionEnd 是同步 hook（会话退出时异步进程会被杀掉，见 docs/step0-findings.md）。Claude Code 给 SessionEnd 的
  *  总时间约 1.5 秒，超过就取消并在终端打一行提示；Node 启动的时间也算在里面，所以发送超时要短 */
@@ -1241,20 +1241,36 @@ function openBrowser(url) {
   } catch { return false; }
 }
 
+/**
+ * /agent-loop:galaxy 的输出。会进对话、发给模型：密钥不能出现在这里，带密钥的网址直接交给浏览器打开。
+ * 退出过目标群（left.json）时没有地方显示你的星系：不打开浏览器、不给 #g=…&mine（那会带人进旧群、把一个已经不在的星系
+ * 标成「你的」），只说清楚已经退出和两条出路
+ * @param {string} dir 插件数据目录 @param {string} value server_url 的值（可能是邀请链接）
+ * @param {((url: string) => boolean) | null} open 打开浏览器；null 表示不打开（--no-open）
+ */
+export function galaxyCommand(dir, value, open) {
+  const target = parseTarget(value);
+  const keys = target.k && !isLocal(target.url) ? deriveKeys(target.k) : null;
+  const node = nodeProblem(process.versions.node);
+  if (keys && leftGroups(dir).includes(keys.group)) {
+    const out = `No galaxy address: you left galaxy group ${fingerprint(keys.group)} on ${target.url} with /agent-loop:leave, ` +
+      "so your galaxy is not shown anywhere right now. To go back to that group, run /agent-loop:rejoin. " +
+      "To show it on this computer instead, set server_url back to http://127.0.0.1:4317 with /plugin configure agent-loop@agent-loop.";
+    return node ? `${out}\nProblem: ${node}` : out;
+  }
+  let out = galaxyUrl(dir, value, false);
+  if (target.k && open && open(galaxyUrl(dir, value, true))) out += "\n(opened in your browser with the group key; the key is not shown here)";
+  const problem = node ?? reportProblem(target, lastStatus(dir), leftGroups(dir));
+  return problem ? `${out}\nProblem: ${problem}` : out;
+}
+
 async function main() {
   const args = process.argv.slice(2);
   if (args[0] === "--galaxy") {
     // /galaxy 命令：命令里的 shell 拿不到插件的环境变量，所以数据目录从参数传进来；地址从 hook 记下的 server.json 读
     const dir = args[1] && !args[1].startsWith("${") ? args[1] : dataDir();
     const given = args[2] && !args[2].startsWith("${") ? args[2] : "";
-    const target = given || rememberedTarget(dir) || serverUrl();
-    // 命令的输出会进对话、发给模型：密钥不能出现在这里。带密钥的网址直接交给浏览器打开
-    let out = galaxyUrl(dir, target, false);
-    if (parseTarget(target).k && !args.includes("--no-open") && openBrowser(galaxyUrl(dir, target, true))) {
-      out += "\n(opened in your browser with the group key; the key is not shown here)";
-    }
-    const problem = nodeProblem(process.versions.node) ?? reportProblem(parseTarget(target), lastStatus(dir), leftGroups(dir));
-    if (problem) out += `\nProblem: ${problem}`;
+    const out = galaxyCommand(dir, given || rememberedTarget(dir) || serverUrl(), args.includes("--no-open") ? null : openBrowser);
     await new Promise(r => process.stdout.write(out + "\n", () => r(undefined)));
     return;
   }
