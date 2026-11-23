@@ -31,11 +31,14 @@ export const DEFAULT_SERVER_URL = "http://127.0.0.1:4317";
 export const PROTOCOL_VERSION = 2;
 /** 插件自己的版本，每次上报放在请求头 x-agent-loop-plugin 里，页面据此提示更新。
  *  和 plugin.json 的 version、shared/src/version.ts 的 PLUGIN_VERSION 一致（测试检查） */
-export const PLUGIN_VERSION = "0.2.11";
+export const PLUGIN_VERSION = "0.2.12";
 /** 第一个由插件建群（/agent-loop:create）的版本：从这一版起页面认 #galaxy=、&created。插件和私有部署分开升级，
  *  所以打开页面前先问服务器的版本（/healthz 的 version），旧的服务器给 #g=，也不在那里建群。
  *  和 shared/src/version.ts 的 CREATE_SINCE 一致（测试检查） */
 export const CREATE_SINCE = "0.2.11";
+/** 第一个认 /agent-loop:leave 打开的 #left= 的页面（清掉浏览器里这个群的密钥、显示已经退出）的版本。
+ *  和 shared/src/version.ts 的 LEFT_SINCE 一致（测试检查） */
+export const LEFT_SINCE = "0.2.12";
 export const SEND_TIMEOUT_MS = 2000;
 /** SessionEnd 是同步 hook（会话退出时异步进程会被杀掉，见 docs/step0-findings.md）。Claude Code 给 SessionEnd 的
  *  总时间约 1.5 秒，超过就取消并在终端打一行提示；Node 启动的时间也算在里面，所以发送超时要短 */
@@ -804,10 +807,14 @@ export async function sendLeave(url, secret, access) {
 
 /**
  * /agent-loop:leave 和 /agent-loop:rejoin。输出会进对话、发给模型：只有服务器地址和指纹，不带密钥
+ * 退出以后在浏览器里打开这个群的页面（#left=<群编号前 16 位>，服务器没收到时加 &kept）：页面认出浏览器里存着的是这个群的密钥
+ * 就清掉，连同「我的星系」的记号，再显示已经退出了。网址里没有密钥（群编号的前 16 位就是页面上人人看得到的指纹）。
+ * 服务器连不上时页面也打不开；比 LEFT_SINCE 旧的页面不认 #left=，打开了反而接着显示这个群：这两种都不开
  * @param {"leave" | "rejoin"} what @param {string} dir @param {string} value server_url 的值
+ * @param {((url: string) => boolean) | null} [open] 打开浏览器；null 表示不打开（--no-open）
  * @returns {Promise<string>}
  */
-export async function leaveOrRejoin(what, dir, value) {
+export async function leaveOrRejoin(what, dir, value, open = null) {
   const target = parseTarget(value);
   const keys = target.k ? deriveKeys(target.k) : null;
   const how = "To report to this computer instead, set server_url back to http://127.0.0.1:4317 with /plugin configure agent-loop@agent-loop.";
@@ -822,8 +829,15 @@ export async function leaveOrRejoin(what, dir, value) {
   const status = await sendLeave(target.url, loadIdentity(dir).secret, keys.access);
   const server = status === 204 ? "Your galaxy was removed from the group on the server, together with the full step details stored there."
     : `The server could not be told (${status === "unreachable" ? "unreachable" : `HTTP ${status}`}); your galaxy stays visible in the group until its sessions time out on the server (shown as possibly closed after 30 minutes, gone within about 2 hours). Run /agent-loop:leave again once the server is reachable to remove it right away.`;
+  let page = 'Browsers that opened the invite link can still watch the group until they choose "Clear cache" under Invite on the page.';
+  if (open && status !== "unreachable") {
+    const v = serverVersion(await serverHealth(target.url));
+    if (!newPage(v, LEFT_SINCE)) page = `This server's page (${v || `before ${LEFT_SINCE}`}) cannot clear the group from a browser by itself: in browsers that opened the invite link, choose "Clear cache" under Invite on the page.`;
+    else if (open(`${target.url}/#left=${keys.group.slice(0, 16)}${status === 204 ? "" : "&kept"}`))
+      page = 'Opened the group\'s page in your browser: it clears this group\'s key from that browser and shows that you left. Other browsers that opened the invite link can still watch the group until they choose "Clear cache" under Invite on the page.';
+  }
   return `Left galaxy group ${fp} on ${target.url}. No session on this computer reports to it any more (no reload needed). ${server}\n` +
-    `server_url still holds the invite link. ${how} To rejoin this group later, run /agent-loop:rejoin. Browsers that opened the invite link can still watch the group until they choose "Stop watching" on the page.`;
+    `server_url still holds the invite link. ${how} To rejoin this group later, run /agent-loop:rejoin. ${page}`;
 }
 
 // ---- 换过群：旧设置的会话不再发（moved.json）
@@ -1311,8 +1325,8 @@ export function serverVersion(r) {
   return typeof v === "string" && /^\d{1,4}\.\d{1,4}\.\d{1,4}$/.test(v) ? v : "";
 }
 
-/** 这个版本的服务器，页面认不认 #galaxy=、&created（不知道版本当作不认） @param {string} version */
-export const newPage = (/** @type {string} */ version) => !!version && !olderThan(version, CREATE_SINCE);
+/** 这个版本的服务器，页面认不认 #galaxy=、&created（since 给 LEFT_SINCE 时：认不认 #left=）。不知道版本当作不认 @param {string} version */
+export const newPage = (/** @type {string} */ version, since = CREATE_SINCE) => !!version && !olderThan(version, since);
 
 /** 用系统的浏览器打开网址（参数直接传给程序，不经过 shell）。失败就算了
  *  Windows 不用 explorer.exe：网址里有 & 时它除了开浏览器，还会多开一个「文档」文件夹窗口；
@@ -1568,8 +1582,9 @@ async function main() {
   if (args[0] === "--leave" || args[0] === "--rejoin") {
     // /agent-loop:leave、/agent-loop:rejoin：和 /galaxy 一样，数据目录从参数传进来，地址从 server.json 读
     const dir = args[1] && !args[1].startsWith("${") ? args[1] : dataDir();
-    const given = args[2] && !args[2].startsWith("${") ? args[2] : "";
-    const out = await leaveOrRejoin(args[0] === "--leave" ? "leave" : "rejoin", dir, given || rememberedTarget(dir) || serverUrl());
+    const given = args[2] && !args[2].startsWith("${") && !args[2].startsWith("--") ? args[2] : "";
+    const out = await leaveOrRejoin(args[0] === "--leave" ? "leave" : "rejoin", dir, given || rememberedTarget(dir) || serverUrl(),
+      args.includes("--no-open") ? null : openBrowser);
     await new Promise(r => process.stdout.write(out + "\n", () => r(undefined)));
     return;
   }
