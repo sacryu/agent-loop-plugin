@@ -31,7 +31,11 @@ export const DEFAULT_SERVER_URL = "http://127.0.0.1:4317";
 export const PROTOCOL_VERSION = 2;
 /** 插件自己的版本，每次上报放在请求头 x-agent-loop-plugin 里，页面据此提示更新。
  *  和 plugin.json 的 version、shared/src/version.ts 的 PLUGIN_VERSION 一致（测试检查） */
-export const PLUGIN_VERSION = "0.2.10";
+export const PLUGIN_VERSION = "0.2.11";
+/** 第一个由插件建群（/agent-loop:create）的版本：从这一版起页面认 #galaxy=、&created。插件和私有部署分开升级，
+ *  所以打开页面前先问服务器的版本（/healthz 的 version），旧的服务器给 #g=，也不在那里建群。
+ *  和 shared/src/version.ts 的 CREATE_SINCE 一致（测试检查） */
+export const CREATE_SINCE = "0.2.11";
 export const SEND_TIMEOUT_MS = 2000;
 /** SessionEnd 是同步 hook（会话退出时异步进程会被杀掉，见 docs/step0-findings.md）。Claude Code 给 SessionEnd 的
  *  总时间约 1.5 秒，超过就取消并在终端打一行提示；Node 启动的时间也算在里面，所以发送超时要短 */
@@ -819,7 +823,7 @@ export async function leaveOrRejoin(what, dir, value) {
   const server = status === 204 ? "Your galaxy was removed from the group on the server, together with the full step details stored there."
     : `The server could not be told (${status === "unreachable" ? "unreachable" : `HTTP ${status}`}); your galaxy stays visible in the group until its sessions time out on the server (shown as possibly closed after 30 minutes, gone within about 2 hours). Run /agent-loop:leave again once the server is reachable to remove it right away.`;
   return `Left galaxy group ${fp} on ${target.url}. No session on this computer reports to it any more (no reload needed). ${server}\n` +
-    `server_url still holds the invite link. ${how} To rejoin this group later, run /agent-loop:rejoin. Browsers that opened the invite link can still watch the group until they leave it on the page.`;
+    `server_url still holds the invite link. ${how} To rejoin this group later, run /agent-loop:rejoin. Browsers that opened the invite link can still watch the group until they choose "Stop watching" on the page.`;
 }
 
 // ---- 换过群：旧设置的会话不再发（moved.json）
@@ -856,6 +860,24 @@ export function markMoved(dir, key, on) {
   const tmp = `${file}.${process.pid}.tmp`;
   writeFileSync(tmp, JSON.stringify({ from: now.slice(-MOVED_MAX) }) + "\n", { mode: 0o600 });
   renameSync(tmp, file);
+}
+
+const STALE_EVERY_MS = 30_000;
+/** 记下「刚才还有旧设置的会话在跑」（hook 因为 staleTarget 没发）。/agent-loop:status 据此提醒 /reload-plugins。
+ *  半分钟内记过就不再写 @param {string} dir @param {number} [now] */
+export function noteStale(dir, now = Date.now()) {
+  if (now - staleSeen(dir) < STALE_EVERY_MS) return;
+  const file = join(dir, "stale.json");
+  try {
+    mkdirSync(dir, { recursive: true });
+    const tmp = `${file}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify({ at: now }) + "\n", { mode: 0o600 });
+    renameSync(tmp, file);
+  } catch { /* 写不了就算了 */ }
+}
+/** 上次看到旧设置的会话是什么时候（毫秒），没有是 0 @param {string} dir @returns {number} */
+export function staleSeen(dir) {
+  try { const t = JSON.parse(readFileSync(join(dir, "stale.json"), "utf8")).at; return typeof t === "number" && isFinite(t) ? t : 0; } catch { return 0; }
 }
 
 /**
@@ -1001,9 +1023,9 @@ function helloPoints(url, share, me) {
     "- What it is: Agent Loop draws running Claude Code sessions as a galaxy (each session a planet, each tool call a ray), and people in the group can see each other's.",
     `- What is shared now (share = ${share || "auto"}, which means ${level} for this server): ${what}.`,
     "- Encryption: apart from anonymous categories and timings, everything is encrypted (AES-256-GCM) with the key in the invite link. The key never goes to the server, so the server can't read it; only people with the link can.",
-    `- Permissions: the plugin is only hooks plus 3 slash commands. Its hook script picks allowed fields out of each event and sends them; it doesn't change any code and has no dependencies. Source: ${PLUGIN_REPO}`,
+    `- Permissions: the plugin is only hooks plus 5 slash commands. Its hook script picks allowed fields out of each event and sends them; it doesn't change any code and has no dependencies. Source: ${PLUGIN_REPO}`,
     `- Ask whether they want to change their name in the group (now: ${me ? JSON.stringify(me) : "an auto-generated catalog number like ALC 1342+27"}) or how much to share (auto, anonymous, summary, full). Change nothing unless they ask. To change, pipe a JSON with only the keys to change into \`claude plugin configure agent-loop@agent-loop --values-stdin\`, for example {"name":"Alice"} or {"share":"anonymous"}, then remind them to run /reload-plugins.`,
-    "- /agent-loop:galaxy opens their galaxy in the browser; /agent-loop:leave takes them out of the group.",
+    "- /agent-loop:galaxy opens their galaxy in the browser; /agent-loop:status shows where it reports; /agent-loop:leave takes them out of the group; /agent-loop:create makes a new group of their own.",
   ];
 }
 
@@ -1104,29 +1126,64 @@ export function transcriptCwd(path) {
 
 /**
  * @param {string} value 邀请链接（或者本机地址）
- * @param {{ cfg: string, dir: string, sid: string, cwd: string, open: boolean }} o
+ * @param {SetUpOptions} o
  * @returns {Promise<string>} 交给 Claude 的输出
  */
 export async function welcome(value, o) {
   try {
     return await setUp(value, o);
   } catch (e) {
-    // 读写不了自己的文件（权限、磁盘满、identity.json 坏了）。只说错误码：错误信息里可能带着文件内容（安装密钥）
-    const code = e && typeof e === "object" && typeof (/** @type {any} */ (e).code) === "string" ? /** @type {any} */ (e).code : "";
-    return `Problem: setting up Agent Loop failed${code ? ` (${code})` : ""} while reading or writing its files in ${o.dir}. ` +
-      "Tell the user this in their language: they may need to check that this folder is writable and not damaged. Do not delete anything there and do not run any other command.";
+    return fileProblem(e, o.dir);
   }
+}
+
+/** 读写不了自己的文件（权限、磁盘满、identity.json 坏了）。只说错误码：错误信息里可能带着文件内容（安装密钥）
+ *  @param {unknown} e @param {string} dir */
+function fileProblem(e, dir) {
+  const code = e && typeof e === "object" && typeof (/** @type {any} */ (e).code) === "string" ? /** @type {any} */ (e).code : "";
+  return `Problem: setting up Agent Loop failed${code ? ` (${code})` : ""} while reading or writing its files in ${dir}. ` +
+    "Tell the user this in their language: they may need to check that this folder is writable and not damaged. Do not delete anything there and do not run any other command.";
+}
+
+/**
+ * @typedef {object} SetUpOptions
+ * @property {string} cfg Claude Code 的配置目录
+ * @property {string} dir 插件数据目录
+ * @property {string} sid 正在跑的会话（CLAUDE_CODE_SESSION_ID），拿不到是 ""
+ * @property {string} cwd 拿不到会话记录时的项目目录
+ * @property {((url: string) => boolean) | null} open 打开浏览器；null 表示不打开（--no-open）
+ * @property {boolean} [created] 刚用 /agent-loop:create 建的群：页面上弹「群建好了」和邀请链接（&created），不弹「这是你的星系」
+ * @property {number | "unreachable" | null} [sent] 已经把这个会话报上去了（建群时先报，服务器收下了才存设置），这是结果
+ * @property {string} [version] 已经问过的服务器版本（serverVersion），没给就问一次
+ */
+
+/**
+ * 把正在跑的这个会话作为一次 SessionStart 报给 value 指的服务器。返回 HTTP 状态码、"unreachable"，没有可报的返回 null
+ * @param {string} value @param {SetUpOptions} o @returns {Promise<number | "unreachable" | null>}
+ */
+async function reportSession(value, o) {
+  const target = parseTarget(value), keys = target.k ? deriveKeys(target.k) : null, local = isLocal(target.url);
+  const { share, me } = savedOptions(o.cfg);
+  const { secret, salt } = loadIdentity(o.dir);
+  const transcript = findTranscript(o.cfg, o.sid), cwd = transcriptCwd(transcript) || o.cwd;
+  const hook = { hook_event_name: "SessionStart", session_id: o.sid, source: "resume", cwd, ...(transcript ? { transcript_path: transcript } : {}) };
+  const ev = buildEvent(hook, {
+    salt, level: shareLevel(share, local), local, key: keys?.content, gid: galaxyId(secret), me, projectDir: cwd,
+    readModel: modelFromTranscript, readUsage: (p, sid) => usageFromTranscript(p, usageCacheFile(o.dir, sid)),
+  });
+  if (!ev) return null;
+  try { return await send(target.url, secret, ev, SEND_TIMEOUT_MS * 2, keys?.access); } catch { return "unreachable"; }
 }
 
 const AGAIN = "ask them to copy the whole message for Claude Code from the Invite panel on the galaxy group's page again";
 
-/** @param {string} value @param {{ cfg: string, dir: string, sid: string, cwd: string, open: boolean }} o @returns {Promise<string>} */
+/** @param {string} value @param {SetUpOptions} o @returns {Promise<string>} */
 async function setUp(value, o) {
   if (!value.trim()) {
     return "Problem: no invite link was given to --welcome (it goes right after --welcome, in quotes).\n" +
       `Tell the user this in their language, and ${AGAIN}. Do not run any other command.`;
   }
-  const target = parseTarget(value), keys = target.k ? deriveKeys(target.k) : null, local = isLocal(target.url);
+  const target = parseTarget(value), keys = target.k ? deriveKeys(target.k) : null;
   const problem = nodeProblem(process.versions.node) ?? reportProblem(target, null, []);
   if (problem) {
     return `Problem: ${problem.replace(/^Agent Loop is not reporting: /, "the invite link given to --welcome is not usable: ")}\n` +
@@ -1141,40 +1198,42 @@ async function setUp(value, o) {
   if (keys && leftGroups(o.dir).includes(keys.group)) markLeft(o.dir, keys.group, false);   // 退出过这个群又拿邀请回来：就是要回去
   // 换群：已经开着的会话在 /reload-plugins 以前还拿着旧的设置，记下来让它们别再发（见 moved.json）
   const prev = rememberedTarget(o.dir), old = prev ? parseTarget(prev) : null, now = targetKey(target);
-  if (old && targetKey(old) !== now) markMoved(o.dir, targetKey(old), true);
+  if (old && targetKey(old) !== now) {
+    markMoved(o.dir, targetKey(old), true);
+    if (o.sid) noteStale(o.dir);   // 跑这条命令的会话自己就拿着旧设置（/agent-loop:status 会提醒它 /reload-plugins）
+  }
   markMoved(o.dir, now, false);
   rememberTarget(o.dir, value);
   const { share, me } = savedOptions(o.cfg);
-  const { secret, salt } = loadIdentity(o.dir);
+  const { secret } = loadIdentity(o.dir);
   // 旧群在别的服务器上：告诉它这个星系走了，不用等超时（同一个服务器上，新群收到事件时已经搬过去了）
   const oldKeys = old && old.k ? deriveKeys(old.k) : null;
   if (old && oldKeys && targetKey(old) !== now && old.url !== target.url && hasScheme(old.url) && !isLocal(old.url)) {
     await sendLeave(old.url, secret, oldKeys.access);
   }
 
-  /** @type {number | "unreachable" | null} */
-  let status = null;
-  if (o.sid) {
-    const transcript = findTranscript(o.cfg, o.sid), cwd = transcriptCwd(transcript) || o.cwd;
-    const hook = { hook_event_name: "SessionStart", session_id: o.sid, source: "resume", cwd, ...(transcript ? { transcript_path: transcript } : {}) };
-    const ev = buildEvent(hook, {
-      salt, level: shareLevel(share, local), local, key: keys?.content, gid: galaxyId(secret), me, projectDir: cwd,
-      readModel: modelFromTranscript, readUsage: (p, sid) => usageFromTranscript(p, usageCacheFile(o.dir, sid)),
-    });
-    if (ev) {
-      try { status = await send(target.url, secret, ev, SEND_TIMEOUT_MS * 2, keys?.access); } catch { status = "unreachable"; }
-      recordStatus(o.dir, target.url, status);
-    }
-  }
+  // 建群时已经先报过了（createGroup 的 sent）：不再报一次
+  const status = o.sent !== undefined ? o.sent : o.sid ? await reportSession(value, o) : null;
+  if (status !== null) recordStatus(o.dir, target.url, status);
   const reported = typeof status === "number" && status < 300, ok = status === null || reported;
   const where = keys ? `galaxy group ${fingerprint(keys.group)} on ${target.url}` : target.url;
-  // &welcome（页面上「这是你的星系，刚才那个对话已经在这里了」）只在真报上去了时带；没报（拿不到会话编号）就只打开；被拒、连不上不开
-  const opened = o.open && ok && openBrowser(`${galaxyUrl(o.dir, value, true)}${reported ? "&welcome" : ""}`);
+  // 服务器的版本：旧服务器的页面不认 #galaxy=（见 galaxyUrl）。建群时已经问过了；被拒、连不上就不问（也不开浏览器）
+  const fresh = newPage(o.version !== undefined ? o.version : ok ? serverVersion(await serverHealth(target.url)) : "");
+  // &welcome（页面上「这是你的星系，刚才那个对话已经在这里了」）只在真报上去了时带；没报（拿不到会话编号）就只打开；被拒、连不上不开。
+  // 刚建的群带 &created：页面弹「群建好了」和邀请链接（不管报没报上去：邀请链接只有在那里才拿得到）
+  const mark = o.created ? "&created" : reported ? "&welcome" : "";
+  const opened = !!o.open && ok && o.open(`${galaxyUrl(o.dir, value, true, fresh)}${mark}`);
   const lines = [
-    `Agent Loop is set up: this computer reports to ${where}.`,
-    `Their galaxy: ${galaxyUrl(o.dir, value, false)}`,
+    o.created ? `Agent Loop created a new galaxy group ${fingerprint(keys?.group ?? "")} on ${target.url}, and this computer now reports to it.`
+      : `Agent Loop is set up: this computer reports to ${where}.`,
+    `Their galaxy: ${galaxyUrl(o.dir, value, false, fresh)}`,
   ];
   if (opened) lines.push(`(opened in the browser${keys ? " with the group key" : ""}; the key is not shown here)`);
+  if (o.created) {
+    lines.push(opened
+      ? "The invite link for friends (the group's only key) is in the panel that opened in the browser, and later under Invite on that page. It is not shown here."
+      : "The invite link for friends (the group's only key) is not shown here: run /agent-loop:galaxy to open the group in the browser, where it is under Invite.");
+  }
   if (!ok) {
     const p = status === "unreachable" ? `could not reach ${target.url}. Check that the server is running and reachable from this computer.`
       : `${target.url} refused the report (HTTP ${status}). The invite link may be wrong or expired.`;
@@ -1188,6 +1247,7 @@ async function setUp(value, o) {
   if (keys) claimHello(o.dir, keys.group);   // 这里讲过了：第一次说话时 hook 不再讲
   lines.push("",
     "Tell the user, in their language, in a short note (a few lines, no headings): " +
+    (o.created ? "that the new group is created and where the invite link is (only share it with people they trust; anyone with it can watch the group), " : "") +
     (opened ? "their galaxy is open in the browser (give the address above as a link)" : "the address of their galaxy above, as a link") +
     (ok ? ", that they should run /reload-plugins now" : ", the problem above and how to fix it") + (keys ? ", and:" : "."),
     ...(keys ? helloPoints(target.url, share, me) : []));
@@ -1222,12 +1282,37 @@ async function readStdin() {
  * @param {string} dir 插件数据目录 @param {string} serverUrlValue server_url 的值（可能是邀请链接）
  * @param {boolean} [withKey] 带不带密钥
  */
-export function galaxyUrl(dir, serverUrlValue, withKey = true) {
+export function galaxyUrl(dir, serverUrlValue, withKey = true, fresh = false) {
   const { url, k } = parseTarget(serverUrlValue);
   const id = galaxyId(loadIdentity(dir).secret);
-  // &mine：告诉页面这是你自己的星系（别人发来的 #g= 链接没有它，不会被当成你的）
-  return `${url}/#${k && withKey ? `k=${k}&` : ""}g=${id}&mine`;
+  // &mine：告诉页面这是你自己的星系（别人发来的 #galaxy= 链接没有它，不会被当成你的）。
+  // 键叫 galaxy=，不叫 g=：g= 容易被当成星系群（group）的编号，而群编号其实只藏在 #k= 里。
+  // 可 0.2.10 以前的服务器的页面只认 g=：确认了服务器够新（fresh，见 newPage）才给 galaxy=。新的页面两种都认
+  return `${url}/#${k && withKey ? `k=${k}&` : ""}${fresh ? "galaxy" : "g"}=${id}&mine`;
 }
+
+/**
+ * 问服务器的 /healthz（不要口令，不带安装密钥）。连不上：reach 是 false；答了但不是 JSON（代理、登录页）：h 是 null
+ * @param {string} url @param {number} [timeoutMs]
+ * @returns {Promise<{ reach: false } | { reach: true, http: number, h: any }>}
+ */
+export async function serverHealth(url, timeoutMs = SEND_TIMEOUT_MS) {
+  /** @type {Response} */
+  let res;
+  try { res = await fetch(url + "/healthz", { signal: AbortSignal.timeout(timeoutMs) }); } catch { return { reach: false }; }
+  let h = null;
+  try { h = res.ok ? await res.json() : (await res.arrayBuffer(), null); } catch { h = null; }
+  return { reach: true, http: res.status, h };
+}
+
+/** /healthz 答的服务器版本。0.2.10 以前的服务器不答、连不上，都是 "" @param {Awaited<ReturnType<typeof serverHealth>>} r */
+export function serverVersion(r) {
+  const v = r.reach && r.h && typeof r.h === "object" ? r.h.version : undefined;
+  return typeof v === "string" && /^\d{1,4}\.\d{1,4}\.\d{1,4}$/.test(v) ? v : "";
+}
+
+/** 这个版本的服务器，页面认不认 #galaxy=、&created（不知道版本当作不认） @param {string} version */
+export const newPage = (/** @type {string} */ version) => !!version && !olderThan(version, CREATE_SINCE);
 
 /** 用系统的浏览器打开网址（参数直接传给程序，不经过 shell）。失败就算了
  *  Windows 不用 explorer.exe：网址里有 & 时它除了开浏览器，还会多开一个「文档」文件夹窗口；
@@ -1243,12 +1328,13 @@ function openBrowser(url) {
 
 /**
  * /agent-loop:galaxy 的输出。会进对话、发给模型：密钥不能出现在这里，带密钥的网址直接交给浏览器打开。
- * 退出过目标群（left.json）时没有地方显示你的星系：不打开浏览器、不给 #g=…&mine（那会带人进旧群、把一个已经不在的星系
+ * 退出过目标群（left.json）时没有地方显示你的星系：不打开浏览器、不给 #galaxy=…&mine（那会带人进旧群、把一个已经不在的星系
  * 标成「你的」），只说清楚已经退出和两条出路
  * @param {string} dir 插件数据目录 @param {string} value server_url 的值（可能是邀请链接）
  * @param {((url: string) => boolean) | null} open 打开浏览器；null 表示不打开（--no-open）
+ * @returns {Promise<string>}
  */
-export function galaxyCommand(dir, value, open) {
+export async function galaxyCommand(dir, value, open) {
   const target = parseTarget(value);
   const keys = target.k && !isLocal(target.url) ? deriveKeys(target.k) : null;
   const node = nodeProblem(process.versions.node);
@@ -1258,10 +1344,185 @@ export function galaxyCommand(dir, value, open) {
       "To show it on this computer instead, set server_url back to http://127.0.0.1:4317 with /plugin configure agent-loop@agent-loop.";
     return node ? `${out}\nProblem: ${node}` : out;
   }
-  let out = galaxyUrl(dir, value, false);
-  if (target.k && open && open(galaxyUrl(dir, value, true))) out += "\n(opened in your browser with the group key; the key is not shown here)";
+  // 服务器旧了（不答版本）、连不上：给旧页面也认的 #g=
+  const fresh = hasScheme(target.url) && newPage(serverVersion(await serverHealth(target.url)));
+  let out = galaxyUrl(dir, value, false, fresh);
+  if (target.k && open && open(galaxyUrl(dir, value, true, fresh))) out += "\n(opened in your browser with the group key; the key is not shown here)";
   const problem = node ?? reportProblem(target, lastStatus(dir), leftGroups(dir));
   return problem ? `${out}\nProblem: ${problem}` : out;
+}
+
+// ---- 建群（/agent-loop:create）
+//
+// 星系群不在服务器上注册：K 在本机随机生成，群在第一条事件到达时出现（开放模式的服务器才收新群，有每个 IP 的限额）。
+// 以前建群在页面上做，浏览器记下 K，可你自己的插件不会跟过去，两边各记各的「在哪个群」。现在只在插件里建：
+//   1. 问服务器收不收新群（/healthz 的 open；本机的服务没有群，白名单的服务器只收管理员登记的群），
+//      服务器够不够新（version：比 CREATE_SINCE 旧的页面不认 &created，邀请链接没处显示）
+//   2. 本机生成 K，先把这个会话报到新群：服务器收下了，群才算建起来（群数上限、每个 IP 的建群限额都在这一步）
+//   3. 交给 `claude plugin configure --values-stdin` 存进 server_url：从标准输入给，不进命令行参数、
+//      shell 历史和对话；和接入命令存的是同一个地方（docs/step0-findings.md）。存不进去就把星系从新群里撤出来
+//   4. 后面和接入命令一样（setUp）：换群的记号、带着密钥在浏览器里打开（&created：页面弹邀请链接）
+// 输出会进对话：不带密钥。命令文件设了 disable-model-invocation，只有用户自己敲得出来
+
+/** 把 server_url 存进 Claude Code 的设置（敏感设置，进安全存储）。存好了返回 null，否则返回出错的说明（不带密钥）
+ *  @param {string} value @returns {Promise<string | null>} */
+export async function saveServerUrl(value) {
+  const body = JSON.stringify({ server_url: value });
+  /** @param {boolean} shell @returns {Promise<{ missing: boolean, error: string | null }>} */
+  const attempt = shell => new Promise(done => {
+    /** @type {import("node:child_process").ChildProcess} */
+    let p;
+    const argv = ["plugin", "configure", PLUGIN_ID, "--values-stdin"];
+    /** @type {import("node:child_process").SpawnOptions} */
+    const opts = { stdio: ["pipe", "ignore", "pipe"], windowsHide: true };
+    try {
+      // 值只从标准输入给。经过 shell 时给一整条命令（参数数组配 shell: true 在 Node 24 上会打 DEP0190 警告，
+      // 那行警告会进命令的输出）；这几个词是固定的，拼不进别的东西
+      p = shell ? spawn(["claude", ...argv].join(" "), { ...opts, shell: true }) : spawn("claude", argv, opts);
+    } catch (e) { done({ missing: false, error: `could not run claude (${/** @type {any} */ (e)?.code || "error"})` }); return; }
+    let err = "", settled = false;
+    /** @type {ReturnType<typeof setTimeout> | undefined} */
+    let timer;
+    const finish = (/** @type {boolean} */ missing, /** @type {string | null} */ error) => { if (!settled) { settled = true; clearTimeout(timer); done({ missing, error }); } };
+    // 超时：连子进程一起停掉。经过 cmd.exe 时 p.kill() 只停得了 cmd，claude 还会接着跑、事后照样把设置存进去
+    const stop = () => {
+      if (process.platform === "win32" && p.pid) {
+        try { spawn("taskkill", ["/pid", String(p.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true }).on("error", () => p.kill()); } catch { p.kill(); }
+      } else p.kill();
+    };
+    timer = setTimeout(() => { stop(); finish(false, "claude plugin configure did not finish within 30 seconds and was stopped"); }, 30_000);
+    p.stderr?.on("data", d => { if (err.length < 2000) err += d; });
+    p.on("error", e => finish(/** @type {any} */ (e).code === "ENOENT", `could not run claude (${/** @type {any} */ (e).code || "error"})`));
+    p.on("close", code => {
+      if (code === 0) return finish(false, null);
+      const line = err.split("\n").map(x => x.trim()).find(Boolean)?.replace(KEY_IN_TEXT, "$1…").slice(0, 200);
+      // shell 找不到命令：cmd 是 1、sh 是 127
+      finish(shell && /not recognized|not found/i.test(err), `claude plugin configure exited with code ${code}${line ? `: ${line}` : ""}`);
+    });
+    p.stdin?.on("error", () => {});
+    p.stdin?.end(body);
+  });
+  let r = await attempt(false);
+  // Windows 上用 npm 装的 claude 是 claude.cmd，不经过 shell 起不来
+  if (r.missing && process.platform === "win32") r = await attempt(true);
+  return r.missing ? "could not find the claude command on PATH" : r.error;
+}
+
+/** 新的星系群密钥：32 字节随机数的 base64url（43 个字符） */
+export const newK = () => b64u(randomBytes(32));
+
+/**
+ * 能不能在这台服务器上建群，看它 /healthz 答的（serverHealth）。能返回 null，不能返回原因
+ *   - 本机的服务（npx agent-loop）没有群
+ *   - 服务器比 CREATE_SINCE 旧（不答 version）：它的页面不认 &created，新群的邀请链接没有地方显示
+ *   - open 是 false：白名单的服务器只收管理员登记的群
+ * @param {string} url @param {Awaited<ReturnType<typeof serverHealth>>} r @returns {string | null}
+ */
+export function createBlocked(url, r) {
+  if (!r.reach) return `could not reach ${url}`;
+  const h = r.h;
+  if (r.http >= 300) return `${url} did not answer like an Agent Loop server (HTTP ${r.http})`;
+  if (!h || typeof h !== "object" || h.ok !== true) return `${url} did not answer like an Agent Loop server`;
+  if (h.local === true) return `${url} is a server for a single computer (npx agent-loop), which has no galaxy groups`;
+  const v = serverVersion(r);
+  if (!newPage(v)) {
+    return `${url} runs an older Agent Loop server (${v || "before 0.2.11"}) whose page cannot show a new group's invite link. ` +
+      `Ask its admin to update the server to ${CREATE_SINCE} or newer, or join one of its groups with an invite link`;
+  }
+  if (h.open === false) return `${url} only accepts galaxy groups its admin has registered. Ask the admin for an invite link (made with npx agent-loop invite) and join with that`;
+  return null;
+}
+
+/** 新群的第一次上报被拒了：为什么 @param {string} url @param {number | "unreachable"} status */
+function createRefused(url, status) {
+  if (status === "unreachable") return `could not reach ${url} to send the first report`;
+  if (status === 503) return `${url} is full (HTTP 503): it has reached its limit of galaxy groups or galaxies. Try again later or ask its admin`;
+  if (status === 429) return `${url} is limiting new galaxy groups and galaxies from this network (HTTP 429). Try again in an hour`;
+  if (status === 403) return `${url} only accepts galaxy groups its admin has registered (HTTP 403). Ask the admin for an invite link (made with npx agent-loop invite) and join with that`;
+  return `${url} refused the first report to the new group (HTTP ${status})`;
+}
+
+/**
+ * /agent-loop:create [服务器地址]。没给地址就用现在报给的那个服务器
+ * @param {string} given 命令后面跟的地址（可以是空的；带着 #… 的只取前面）
+ * @param {SetUpOptions & { save: (value: string) => Promise<string | null> }} o
+ * @returns {Promise<string>} 交给 Claude 的输出
+ */
+export async function createGroup(given, o) {
+  const fail = (/** @type {string} */ why) =>
+    `Problem: no galaxy group was created: ${why}. Nothing was changed.\nTell the user this in their language. Do not run any other command.`;
+  const node = nodeProblem(process.versions.node);
+  if (node) return fail(node.replace(/^Agent Loop is not reporting: /, "").replace(/\.$/, ""));
+  const arg = given.trim().replace(/^["']+|["']+$/g, "");
+  const url = parseTarget(arg ? arg.split("#")[0] : rememberedTarget(o.dir)).url;
+  const usage = "Usage: /agent-loop:create https://<server>";
+  if (!hasScheme(url)) return fail(`the server address must start with https:// or http:// (got "${url.slice(0, 200)}"). ${usage}`);
+  if (isLocal(url)) {
+    return fail(arg ? `${url} is this computer, and a server on this computer has no galaxy groups. ${usage}`
+      : `this computer reports to a server on this computer (${url}), which has no galaxy groups. Say which server to create it on. ${usage}`);
+  }
+  if (!installedVersion(o.cfg)) return fail(`the Agent Loop plugin is not installed under ${o.cfg}`);
+  const health = await serverHealth(url, SEND_TIMEOUT_MS * 2);
+  const blocked = createBlocked(url, health);
+  if (blocked) return fail(blocked);
+  const k = newK(), value = `${url}/#k=${k}`, access = /** @type {NonNullable<ReturnType<typeof deriveKeys>>} */ (deriveKeys(k)).access;
+  // 先把这个会话报到新群，服务器真收下了（群建起来了）才存设置：群数到了上限、这个 IP 建群太多、服务器这时连不上，
+  // 都要在动 server_url 以前知道，不然插件指着一个不存在的群，原来那个群的邀请链接也从设置里没了。
+  // 拿不到会话编号（旧版的 Claude Code）就没法先试，只能照常存
+  /** @type {number | "unreachable" | null} */
+  let sent;
+  try { sent = o.sid ? await reportSession(value, o) : null; } catch (e) { return fileProblem(e, o.dir); }
+  if (sent !== null && !(typeof sent === "number" && sent < 300)) return fail(createRefused(url, sent));
+  const saveError = await o.save(value);
+  if (saveError) {
+    // 新群已经在服务器上了，星系也搬了进去：搬出来（同一个服务器上的旧群，旧会话下一步就把它带回去）
+    if (sent !== null) await sendLeave(url, loadIdentity(o.dir).secret, access);
+    return fail(`the new invite link could not be saved into the plugin's server_url setting (${saveError})`);
+  }
+  return welcome(value, { ...o, created: true, sent, version: serverVersion(health) });
+}
+
+// ---- 现在的状态（/agent-loop:status）
+
+/**
+ * 只读：报给哪里、在不在群里、上次发得怎么样、星系的编号和名字、分享多少、插件版本。输出会进对话：不带密钥
+ * @param {string} dir 插件数据目录 @param {string} value server_url 的值 @param {string} cfg Claude Code 的配置目录
+ * @param {number} [now]
+ */
+export function statusCommand(dir, value, cfg, now = Date.now()) {
+  const target = parseTarget(value), local = isLocal(target.url);
+  const keys = target.k && !local ? deriveKeys(target.k) : null;
+  const left = !!keys && leftGroups(dir).includes(keys.group);
+  const { share, me } = savedOptions(cfg);
+  const last = lastStatus(dir), have = installedVersion(cfg);
+  const problem = nodeProblem(process.versions.node) ?? reportProblem(target, last, leftGroups(dir));
+  const where = local ? `a server on this computer (${target.url})` : keys ? `galaxy group ${fingerprint(keys.group)} on ${target.url}` : target.url;
+  const mine = last && last.url === target.url ? last.status : null;
+  const lastLine = mine === null ? "nothing sent to this server yet"
+    : mine === "unreachable" ? "could not reach the server"
+    : mine < 300 ? "accepted" : `refused (HTTP ${mine})`;
+  // reportProblem 不管 429、5xx（多半一会儿就好），可上次确实没送到：不能说「在报」
+  const state = left ? "left this group with /agent-loop:leave, so nothing is sent (/agent-loop:rejoin goes back)"
+    : problem ? "not reporting (see Problem)"
+    : mine === null ? "set up; nothing sent yet"
+    : mine === "unreachable" || mine >= 300 ? "not reporting right now: the last report did not get through (see Last report); every step tries again"
+    : "reporting";
+  const update = have && olderThan(have, PLUGIN_VERSION) ? `; run \`claude plugin update ${PLUGIN_ID}\`` : "";
+  // 换过群以后还拿着旧设置的会话（staleTarget）什么都不发：这条命令看不到是哪个会话在跑，只能说最近见到过
+  const staleAgo = now - staleSeen(dir), STALE_RECENT_MS = 30 * 60_000;
+  const lines = [
+    `Reports to: ${where}`,
+    `State: ${state}`,
+    ...(staleAgo >= 0 && staleAgo < STALE_RECENT_MS && !left
+      ? [`Old sessions: ${Math.max(1, Math.round(staleAgo / 60_000))} min ago a session that was open before the last switch of server_url (including the one that ran /agent-loop:create or the setup) still had the old setting, so it sends nothing. Run /reload-plugins in each session that was open before the switch.`]
+      : []),
+    `Last report: ${lastLine}`,
+    `Galaxy: ${galaxyId(loadIdentity(dir).secret)}, named ${me ? JSON.stringify(me) : "with an auto-generated catalog number"}`,
+    `Sharing: ${share || "auto"} (${SHARE_WHAT[shareLevel(share, local)][0]} for this server)`,
+    `Plugin: ${PLUGIN_VERSION}${have && have !== PLUGIN_VERSION ? ` (installed: ${have}${update})` : ""}`,
+  ];
+  if (problem && !left) lines.push(`Problem: ${problem}`);
+  return lines.join("\n");
 }
 
 async function main() {
@@ -1270,7 +1531,7 @@ async function main() {
     // /galaxy 命令：命令里的 shell 拿不到插件的环境变量，所以数据目录从参数传进来；地址从 hook 记下的 server.json 读
     const dir = args[1] && !args[1].startsWith("${") ? args[1] : dataDir();
     const given = args[2] && !args[2].startsWith("${") ? args[2] : "";
-    const out = galaxyCommand(dir, given || rememberedTarget(dir) || serverUrl(), args.includes("--no-open") ? null : openBrowser);
+    const out = await galaxyCommand(dir, given || rememberedTarget(dir) || serverUrl(), args.includes("--no-open") ? null : openBrowser);
     await new Promise(r => process.stdout.write(out + "\n", () => r(undefined)));
     return;
   }
@@ -1280,8 +1541,27 @@ async function main() {
     // 链接是第一个不以 -- 开头的参数（--no-open 放在前面也认得）；没有就照实说，不退回本机地址
     const out = await welcome(args.slice(1).find(a => !a.startsWith("--")) ?? "", {
       cfg, dir: env && !env.startsWith("${") ? env : installedDataDir(cfg),
-      sid: (process.env.CLAUDE_CODE_SESSION_ID || "").trim(), cwd: process.cwd(), open: !args.includes("--no-open"),
+      sid: (process.env.CLAUDE_CODE_SESSION_ID || "").trim(), cwd: process.cwd(), open: args.includes("--no-open") ? null : openBrowser,
     });
+    await new Promise(r => process.stdout.write(out + "\n", () => r(undefined)));
+    return;
+  }
+  if (args[0] === "--create") {
+    // /agent-loop:create：数据目录从参数传进来，后面是用户给的服务器地址（可以没有：命令正文里的 $ARGUMENTS 是空的或没被替换）
+    // 命令文件把 "$ARGUMENTS" 整个当一个参数传进来（/agent-loop:create https://srv --no-open 是一个参数）：拆开再认
+    const dir = args[1] && !args[1].startsWith("${") ? args[1] : dataDir();
+    const words = args.slice(2).flatMap(a => a.split(/\s+/)).filter(Boolean);
+    const given = words.find(w => !w.startsWith("--") && !w.startsWith("$")) ?? "";
+    const out = await createGroup(given, {
+      cfg: configDir(), dir, sid: (process.env.CLAUDE_CODE_SESSION_ID || "").trim(), cwd: process.cwd(),
+      open: words.includes("--no-open") ? null : openBrowser, save: saveServerUrl,
+    });
+    await new Promise(r => process.stdout.write(out + "\n", () => r(undefined)));
+    return;
+  }
+  if (args[0] === "--status") {
+    const dir = args[1] && !args[1].startsWith("${") ? args[1] : dataDir();
+    const out = statusCommand(dir, rememberedTarget(dir) || serverUrl(), configDir());
     await new Promise(r => process.stdout.write(out + "\n", () => r(undefined)));
     return;
   }
@@ -1328,7 +1608,7 @@ async function main() {
   // 改设置以前开的会话还拿着旧值，不能让它把新会话记下的好地址冲掉
   if (!hasScheme(target.url) || (!local && !keys)) { if (!rememberedTarget(dir)) rememberTarget(dir, value); return; }
   // 换过群以后还没 /reload-plugins 的旧会话：不发，也不把旧链接写回 server.json
-  if (staleTarget(dir, target, hook)) return;
+  if (staleTarget(dir, target, hook)) { noteStale(dir); return; }
   rememberTarget(dir, value);
   // 用 /agent-loop:leave 退出过这个星系群：不发（会话开始时的检查会说明）
   if (keys && leftGroups(dir).includes(keys.group)) return;
