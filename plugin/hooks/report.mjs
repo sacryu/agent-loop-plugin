@@ -12,6 +12,8 @@
 //   - 发往别处时附件一律用 AES-256-GCM 加密，密钥从邀请链接（#k=…）里派生，只在你的插件和看的人的浏览器里。
 //     没有邀请链接（没有密钥）就什么都不发。
 //   - 用 /agent-loop:leave 退出过的星系群也什么都不发（记在插件数据目录的 left.json 里，/agent-loop:rejoin 去掉）。
+//   - 用接入命令换了群以后，还拿着旧设置的会话也不发（moved.json，/reload-plugins 以后就是新设置了）。
+//   - 附件里出现的邀请密钥（k=…）一律抹掉，不会跟着别的内容发出去。
 //
 // 这个文件不能依赖任何包，也不能从仓库其他目录导入（插件装到你机器上时只有 plugin/ 这一个目录）。
 // 任何失败都吞掉：不往标准输出写任何东西，退出码永远是 0。需要 Node 18 以上（自带 fetch）。
@@ -29,7 +31,7 @@ export const DEFAULT_SERVER_URL = "http://127.0.0.1:4317";
 export const PROTOCOL_VERSION = 2;
 /** 插件自己的版本，每次上报放在请求头 x-agent-loop-plugin 里，页面据此提示更新。
  *  和 plugin.json 的 version、shared/src/version.ts 的 PLUGIN_VERSION 一致（测试检查） */
-export const PLUGIN_VERSION = "0.2.8";
+export const PLUGIN_VERSION = "0.2.9";
 export const SEND_TIMEOUT_MS = 2000;
 /** SessionEnd 是同步 hook（会话退出时异步进程会被杀掉，见 docs/step0-findings.md）。Claude Code 给 SessionEnd 的
  *  总时间约 1.5 秒，超过就取消并在终端打一行提示；Node 启动的时间也算在里面，所以发送超时要短 */
@@ -537,6 +539,21 @@ function pruneUsageCache(dir) {
   } catch { /* 还没有 */ }
 }
 
+/** 邀请链接里的密钥（k= 后面 43 个字符） */
+const KEY_IN_TEXT = /(\bk=)[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])/g;
+
+/**
+ * 把 hook 数据里出现的邀请密钥抹掉（换成 k=…）。接入、换群时那几行命令、粘进来的邀请链接、回答里复述的链接都带着
+ * 新群的密钥：不抹掉的话，档位 2 会把它（用旧群的密钥加密）发给旧群，旧群的人就能拿它进新群。没有就原样返回
+ * @param {any} hook @returns {any}
+ */
+export function scrubKeys(hook) {
+  let text;
+  try { text = JSON.stringify(hook); } catch { return hook; }
+  if (!text || text.search(KEY_IN_TEXT) < 0) return hook;
+  return JSON.parse(text.replace(KEY_IN_TEXT, "$1…"));
+}
+
 /**
  * 从原始 hook 数据挑出允许的字段，重新拼一条事件。返回 null 表示这条不发。
  * 这是白名单：下面没写到的字段一律不出去，Claude Code 以后新增的字段默认也不会被传出去。
@@ -549,6 +566,7 @@ function pruneUsageCache(dir) {
  */
 export function buildEvent(hook, ctx) {
   if (!hook || typeof hook !== "object") return null;
+  hook = scrubKeys(hook);
   const name = hook.hook_event_name;
   if (!EVENT_NAMES.includes(name) || !str(hook.session_id)) return null;
   const H = (/** @type {string} */ v) => hash16(ctx.salt, v);
@@ -681,8 +699,10 @@ export function loadIdentity(dir) {
   return read();
 }
 
+/** 插件数据目录：hook 里是 CLAUDE_PLUGIN_DATA；拿不到时（命令正文里的 ${CLAUDE_PLUGIN_DATA} 没被替换）用同一个目录 */
 export function dataDir() {
-  return process.env.CLAUDE_PLUGIN_DATA || join(homedir(), ".claude", "plugins", "data", "agent-loop");
+  const env = process.env.CLAUDE_PLUGIN_DATA;
+  return env && !env.startsWith("${") ? env : installedDataDir();
 }
 
 /**
@@ -801,6 +821,60 @@ export async function leaveOrRejoin(what, dir, value) {
   return `Left galaxy group ${fp} on ${target.url}. No session on this computer reports to it any more (no reload needed). ${server}\n` +
     `server_url still holds the invite link. ${how} To rejoin this group later, run /agent-loop:rejoin. Browsers that opened the invite link can still watch the group until they leave it on the page.`;
 }
+
+// ---- 换过群：旧设置的会话不再发（moved.json）
+//
+// 接入命令（--welcome）把 server_url 换成新的邀请链接，可已经开着的会话（包括跑这条命令的这个）在 /reload-plugins 以前
+// 拿的还是旧值：它们的 hook 照样拿同一个安装密钥报给旧群，服务器每收到一条就把星系在两个群之间搬一次，还会把 server.json
+// 改回旧链接。所以 --welcome 把旧的目标记下来，拿着它的 hook 不发、不记地址。
+// 新开的会话（SessionStart 的 startup）拿的一定是当前的设置：它还是旧值，说明用户又改回去了，去掉记号照常发。
+
+const MOVED_MAX = 20;
+
+/** 一个目标的记号：星系群用群编号，别的用地址 @param {{ url: string, k: string | null }} target */
+export function targetKey(target) {
+  const keys = target.k ? deriveKeys(target.k) : null;
+  return keys ? `g:${keys.group}` : `u:${target.url}`;
+}
+
+/** 换走了的目标（targetKey） @param {string} dir @returns {string[]} */
+export function movedFrom(dir) {
+  try {
+    const g = JSON.parse(readFileSync(join(dir, "moved.json"), "utf8")).from;
+    return Array.isArray(g) ? g.filter(x => typeof x === "string" && x.length <= 400) : [];
+  } catch { return []; }
+}
+
+/** 记下（on）或者去掉（!on）一个换走了的目标。没变就不写 @param {string} dir @param {string} key @param {boolean} on */
+export function markMoved(dir, key, on) {
+  const was = movedFrom(dir);
+  if (was.includes(key) === on) return;
+  const now = was.filter(g => g !== key);
+  if (on) now.push(key);
+  const file = join(dir, "moved.json");
+  mkdirSync(dir, { recursive: true });
+  const tmp = `${file}.${process.pid}.tmp`;
+  writeFileSync(tmp, JSON.stringify({ from: now.slice(-MOVED_MAX) }) + "\n", { mode: 0o600 });
+  renameSync(tmp, file);
+}
+
+/**
+ * 这个 hook 拿的是换走了的旧设置：返回 true 表示不发。新开的会话拿着它时去掉记号（见上）
+ * @param {string} dir @param {{ url: string, k: string | null }} target @param {any} hook
+ */
+export function staleTarget(dir, target, hook) {
+  const key = targetKey(target);
+  if (!movedFrom(dir).includes(key)) return false;
+  if (hook && hook.hook_event_name === "SessionStart" && hook.source === "startup") {
+    try { markMoved(dir, key, false); } catch { /* 写不了：这次照常发 */ }
+    return false;
+  }
+  return true;
+}
+
+/** 旧设置的会话里说话、/clear 时提示一行。不带密钥 @param {string} url */
+export const staleMessage = url =>
+  `Agent Loop: this session still has the old server_url (${url}) from before you joined another galaxy group, so it is not reporting. Run /reload-plugins to switch it over. (If you switched back to ${url} on purpose, open a new session.)`;
 
 // ---- 上报不出去时告诉用户
 //
@@ -1034,16 +1108,49 @@ export function transcriptCwd(path) {
  * @returns {Promise<string>} 交给 Claude 的输出
  */
 export async function welcome(value, o) {
+  try {
+    return await setUp(value, o);
+  } catch (e) {
+    // 读写不了自己的文件（权限、磁盘满、identity.json 坏了）。只说错误码：错误信息里可能带着文件内容（安装密钥）
+    const code = e && typeof e === "object" && typeof (/** @type {any} */ (e).code) === "string" ? /** @type {any} */ (e).code : "";
+    return `Problem: setting up Agent Loop failed${code ? ` (${code})` : ""} while reading or writing its files in ${o.dir}. ` +
+      "Tell the user this in their language: they may need to check that this folder is writable and not damaged. Do not delete anything there and do not run any other command.";
+  }
+}
+
+const AGAIN = "ask them to copy the whole message for Claude Code from the Invite panel on the galaxy group's page again";
+
+/** @param {string} value @param {{ cfg: string, dir: string, sid: string, cwd: string, open: boolean }} o @returns {Promise<string>} */
+async function setUp(value, o) {
+  if (!value.trim()) {
+    return "Problem: no invite link was given to --welcome (it goes right after --welcome, in quotes).\n" +
+      `Tell the user this in their language, and ${AGAIN}. Do not run any other command.`;
+  }
   const target = parseTarget(value), keys = target.k ? deriveKeys(target.k) : null, local = isLocal(target.url);
   const problem = nodeProblem(process.versions.node) ?? reportProblem(target, null, []);
   if (problem) {
     return `Problem: ${problem.replace(/^Agent Loop is not reporting: /, "the invite link given to --welcome is not usable: ")}\n` +
-      "Tell the user this in their language, and ask them to copy the whole message for Claude Code from the Invite panel on the galaxy group's page again. Do not run any other command.";
+      `Tell the user this in their language, and ${AGAIN}. Do not run any other command.`;
+  }
+  // 插件没装上（安装那一行失败了）：重载以后没有 hook，报上去的这一次也接不上。先别动任何东西
+  const have = installedVersion(o.cfg);
+  if (!have) {
+    return `Problem: the Agent Loop plugin is not installed, so the install line (claude plugin install ${PLUGIN_ID} …) did not work.\n` +
+      "Tell the user this in their language, with the error that line printed if there was one. Once the cause is fixed, run the install line and then this line again.";
   }
   if (keys && leftGroups(o.dir).includes(keys.group)) markLeft(o.dir, keys.group, false);   // 退出过这个群又拿邀请回来：就是要回去
+  // 换群：已经开着的会话在 /reload-plugins 以前还拿着旧的设置，记下来让它们别再发（见 moved.json）
+  const prev = rememberedTarget(o.dir), old = prev ? parseTarget(prev) : null, now = targetKey(target);
+  if (old && targetKey(old) !== now) markMoved(o.dir, targetKey(old), true);
+  markMoved(o.dir, now, false);
   rememberTarget(o.dir, value);
   const { share, me } = savedOptions(o.cfg);
   const { secret, salt } = loadIdentity(o.dir);
+  // 旧群在别的服务器上：告诉它这个星系走了，不用等超时（同一个服务器上，新群收到事件时已经搬过去了）
+  const oldKeys = old && old.k ? deriveKeys(old.k) : null;
+  if (old && oldKeys && targetKey(old) !== now && old.url !== target.url && hasScheme(old.url) && !isLocal(old.url)) {
+    await sendLeave(old.url, secret, oldKeys.access);
+  }
 
   /** @type {number | "unreachable" | null} */
   let status = null;
@@ -1059,9 +1166,10 @@ export async function welcome(value, o) {
       recordStatus(o.dir, target.url, status);
     }
   }
-  const ok = status === null || (typeof status === "number" && status < 300);
+  const reported = typeof status === "number" && status < 300, ok = status === null || reported;
   const where = keys ? `galaxy group ${fingerprint(keys.group)} on ${target.url}` : target.url;
-  const opened = status !== "unreachable" && o.open && openBrowser(`${galaxyUrl(o.dir, value, true)}&welcome`);
+  // &welcome（页面上「这是你的星系，刚才那个对话已经在这里了」）只在真报上去了时带；没报（拿不到会话编号）就只打开；被拒、连不上不开
+  const opened = o.open && ok && openBrowser(`${galaxyUrl(o.dir, value, true)}${reported ? "&welcome" : ""}`);
   const lines = [
     `Agent Loop is set up: this computer reports to ${where}.`,
     `Their galaxy: ${galaxyUrl(o.dir, value, false)}`,
@@ -1076,8 +1184,7 @@ export async function welcome(value, o) {
   } else {
     lines.push("Their galaxy shows up once the user runs /reload-plugins (Claude can't run it) and says something; new sessions report on their own.");
   }
-  const have = installedVersion(o.cfg);
-  if (have && olderThan(have, PLUGIN_VERSION)) lines.push(`The installed plugin is ${have}, older than ${PLUGIN_VERSION}: run \`claude plugin update ${PLUGIN_ID}\` now, before /reload-plugins.`);
+  if (olderThan(have, PLUGIN_VERSION)) lines.push(`The installed plugin is ${have}, older than ${PLUGIN_VERSION}: run \`claude plugin update ${PLUGIN_ID}\` now, before /reload-plugins.`);
   if (keys) claimHello(o.dir, keys.group);   // 这里讲过了：第一次说话时 hook 不再讲
   lines.push("",
     "Tell the user, in their language, in a short note (a few lines, no headings): " +
@@ -1154,7 +1261,8 @@ async function main() {
   if (args[0] === "--welcome") {
     // 接入（页面上那段话的最后一行）：Claude 在 Bash 里跑，从插件市场的目录。数据目录是插件装好以后 hook 用的那个
     const cfg = configDir(), env = process.env.CLAUDE_PLUGIN_DATA;
-    const out = await welcome(args[1] || "", {
+    // 链接是第一个不以 -- 开头的参数（--no-open 放在前面也认得）；没有就照实说，不退回本机地址
+    const out = await welcome(args.slice(1).find(a => !a.startsWith("--")) ?? "", {
       cfg, dir: env && !env.startsWith("${") ? env : installedDataDir(cfg),
       sid: (process.env.CLAUDE_CODE_SESSION_ID || "").trim(), cwd: process.cwd(), open: !args.includes("--no-open"),
     });
@@ -1177,14 +1285,19 @@ async function main() {
     // 异步 hook 的输出不会显示给用户、也不进上下文，所以这一步必须是同步的。
     // 会话开始时：设置或上次的发送有问题就提示一行（压缩上下文时不重复）。
     // 用户说话时：第一次接上这个星系群，把说明交给 Claude（helloContext）
+    // 换过群以后还没 /reload-plugins 的旧会话：说话、/clear 时提示一行（新开的会话不算，见 staleTarget）
     let out = null;
-    if (hook.hook_event_name === "UserPromptSubmit") {
+    const dir = dataDir();
+    const stale = !(hook.hook_event_name === "SessionStart" && hook.source === "startup") && movedFrom(dir).includes(targetKey(target));
+    if (stale) {
+      if (hook.source !== "compact") out = { systemMessage: staleMessage(target.url) };
+    } else if (hook.hook_event_name === "UserPromptSubmit") {
       // 设置或上次的发送有问题时不讲（会话开始时已经提示过怎么改）
-      const dir = dataDir(), bad = nodeProblem(process.versions.node) ?? reportProblem(target, lastStatus(dir), leftGroups(dir));
+      const bad = nodeProblem(process.versions.node) ?? reportProblem(target, lastStatus(dir), leftGroups(dir));
       const ctx = bad ? null : helloContext(dir, target, share, me);
       if (ctx) out = { hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: ctx } };
     } else if (hook.source !== "compact") {
-      const problem = nodeProblem(process.versions.node) ?? reportProblem(target, lastStatus(dataDir()), leftGroups(dataDir()));
+      const problem = nodeProblem(process.versions.node) ?? reportProblem(target, lastStatus(dir), leftGroups(dir));
       if (problem) out = { systemMessage: problem };
     }
     if (out) await new Promise(r => process.stdout.write(JSON.stringify(out) + "\n", () => r(undefined)));
@@ -1198,6 +1311,8 @@ async function main() {
   // 这时只在还没记过地址时记一下（新用户设错了，/galaxy 也能照实说出问题）；记过就不动：
   // 改设置以前开的会话还拿着旧值，不能让它把新会话记下的好地址冲掉
   if (!hasScheme(target.url) || (!local && !keys)) { if (!rememberedTarget(dir)) rememberTarget(dir, value); return; }
+  // 换过群以后还没 /reload-plugins 的旧会话：不发，也不把旧链接写回 server.json
+  if (staleTarget(dir, target, hook)) return;
   rememberTarget(dir, value);
   // 用 /agent-loop:leave 退出过这个星系群：不发（会话开始时的检查会说明）
   if (keys && leftGroups(dir).includes(keys.group)) return;
