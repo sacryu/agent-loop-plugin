@@ -22,17 +22,19 @@
 import { createCipheriv, createHash, hkdfSync, randomBytes } from "node:crypto";
 import { closeSync, fstatSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { spawn } from "node:child_process";
 
 /** 默认发往本机（plugin.json 里 userConfig.server_url 的默认值要一起改，测试会检查两处一致）。
  *  本机没有服务在听时静默失败，没有任何可见影响 */
 export const DEFAULT_SERVER_URL = "http://127.0.0.1:4317";
+/** 插件在 Claude Code 里的名字（插件@市场）：命令行、设置、给用户的提示都用它 */
+export const PLUGIN_ID = "agent-loop@agent-loop";
 export const PROTOCOL_VERSION = 2;
 /** 插件自己的版本，每次上报放在请求头 x-agent-loop-plugin 里，页面据此提示更新。
  *  和 plugin.json 的 version、shared/src/version.ts 的 PLUGIN_VERSION 一致（测试检查） */
-export const PLUGIN_VERSION = "0.2.13";
+export const PLUGIN_VERSION = "0.2.14";
 /** 第一个由插件建群（/agent-loop:create）的版本：从这一版起页面认 #galaxy=、&created。插件和私有部署分开升级，
  *  所以打开页面前先问服务器的版本（/healthz 的 version），旧的服务器给 #g=，也不在那里建群。
  *  和 shared/src/version.ts 的 CREATE_SINCE 一致（测试检查） */
@@ -86,6 +88,8 @@ export const NOTIFICATION_TYPES = [
 export const BUILTIN_AGENT_TYPES = ["general-purpose", "Explore", "Plan", "statusline-setup", "claude-code-guide"];
 /** 模型名只认 Claude 的模型名（claude-… 或几个别名），别的（比如自建网关上起的名字）一律不传 */
 export const MODEL_RE = /^(claude-[a-z0-9.-]{1,60}(\[1m\])?|opus|sonnet|haiku|fable)$/;
+/** 能当模型名发出去的：字符串、不超过 80 个字符、过 MODEL_RE @param {unknown} v @returns {v is string} */
+const isModel = v => typeof v === "string" && v.length <= 80 && MODEL_RE.test(v);
 export const SHARE_OPTIONS = ["auto", "anonymous", "summary", "full"];
 const TOOL_EVENTS = new Set(["PreToolUse", "PostToolUse", "PostToolUseFailure", "PermissionRequest", "PermissionDenied"]);
 const LOOPBACK = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
@@ -159,10 +163,11 @@ export function hash16(salt, value) {
   return createHash("sha256").update(salt + value).digest("hex").slice(0, 16);
 }
 
-/** 公开的星系编号 = sha256(secret) 的前 32 个十六进制字符 @param {string} secret */
-export function galaxyId(secret) {
-  return createHash("sha256").update(secret).digest("hex").slice(0, ID_HEX);
-}
+/** sha256 的前 32 个十六进制字符：公开的星系编号 = idOf(secret)，星系群编号 = idOf(口令)，服务器也这样算 @param {string} v */
+const idOf = v => createHash("sha256").update(v).digest("hex").slice(0, ID_HEX);
+
+/** 公开的星系编号 @param {string} secret */
+export const galaxyId = secret => idOf(secret);
 
 /** 项目目录哈希前统一大小写和分隔符 @param {string} dir */
 export function normDir(dir) {
@@ -362,7 +367,7 @@ export function deriveKeys(k) {
   if (K.length !== 32) return null;
   const hk = (/** @type {string} */ info) => Buffer.from(hkdfSync("sha256", K, Buffer.alloc(0), info, 32));
   const access = b64u(hk("agent-loop/access/v1"));
-  return { access, group: createHash("sha256").update(access).digest("hex").slice(0, ID_HEX), content: hk("agent-loop/content/v1") };
+  return { access, group: idOf(access), content: hk("agent-loop/content/v1") };
 }
 
 /**
@@ -400,30 +405,37 @@ export function slotsOf(ev, gid = "") {
 /** 附加校验数据 @param {string} slot @param {string} sid @param {string} k */
 export const aadOf = (slot, sid, k) => `agent-loop/${PROTOCOL_VERSION}|${slot}|${sid}|${k}`;
 
-// ---- 模型名：hook 数据里没有（docs/step0-findings.md），从会话记录末尾最后一条回答里取
+// ---- 模型名：hook 数据里没有（docs/step0-findings.md）。主对话的在 usageFromTranscript 里顺带取；
+// 它取不到时（子 agent 的事件、记录里还没有主对话的回答）从会话记录末尾最后一条回答里取
 
 /** @param {unknown} path @returns {string | undefined} */
 export function modelFromTranscript(path) {
   if (!str(path)) return undefined;
+  const lines = readLines(path, 64 * 1024, true);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (!lines[i].includes('"assistant"')) continue;
+    try {
+      const o = JSON.parse(lines[i]);
+      const mdl = o && o.type === "assistant" && o.message && o.message.model;
+      if (isModel(mdl)) return mdl;
+    } catch { /* 第一行可能被截断了 */ }
+  }
+  return undefined;
+}
+
+/** 文件开头（或者 fromEnd：末尾）最多 max 字节，按行拆开。读不了返回 []；头尾那行可能被截断了
+ *  @param {string} path @param {number} max @param {boolean} [fromEnd] @returns {string[]} */
+function readLines(path, max, fromEnd = false) {
   /** @type {number | undefined} */
   let fd;
   try {
-    fd = openSync(/** @type {string} */ (path), "r");
-    const size = fstatSync(fd).size, n = Math.min(size, 64 * 1024), buf = Buffer.alloc(n);
-    readSync(fd, buf, 0, n, size - n);
-    const lines = buf.toString("utf8").split("\n");
-    for (let i = lines.length - 1; i >= 0; i--) {
-      if (!lines[i].includes('"assistant"')) continue;
-      try {
-        const o = JSON.parse(lines[i]);
-        const mdl = o && o.type === "assistant" && o.message && o.message.model;
-        if (typeof mdl === "string" && mdl.length <= 80 && MODEL_RE.test(mdl)) return mdl;
-      } catch { /* 第一行可能被截断了 */ }
-    }
-  } catch { /* 没有这个文件 */ } finally {
+    fd = openSync(path, "r");
+    const size = fstatSync(fd).size, buf = Buffer.alloc(Math.min(size, max));
+    readSync(fd, buf, 0, buf.length, fromEnd ? size - buf.length : 0);
+    return buf.toString("utf8").split("\n");
+  } catch { return []; /* 没有这个文件 */ } finally {
     if (fd !== undefined) try { closeSync(fd); } catch { /* ignore */ }
   }
-  return undefined;
 }
 
 // ---- token 数和对话的标题：hook 数据里也没有，从会话记录里读
@@ -434,6 +446,7 @@ export function modelFromTranscript(path) {
 // 用 /rename 改过的（type "custom-title"）优先。
 // laps：主对话回答了几次（按 message.id 数，Claude Code 自己补的 <synthetic> 回答不算），一次回答就是一圈；
 // steps：主对话调用了几次工具（tool_use）。服务器重启过、会话中途才接上时，页面上的累计圈数、步数靠这两个数补回来。
+// model：到目前为止主对话最后一条真实回答（不是 <synthetic>）的模型名，SessionStart、Stop 时用，省得再读一遍记录末尾。
 // 记录可能有几十 MB：记下读到了哪里（cacheFile），下次从那里接着读。
 
 const USAGE_CHUNK = 1 << 20;
@@ -441,23 +454,23 @@ const MAX_TOK = 1e11;
 const tokN = (/** @type {unknown} */ v) => (typeof v === "number" && isFinite(v) && v > 0 ? Math.floor(v) : 0);
 
 const TITLE_MAX = 80;
-const USAGE_CACHE_V = 3;   // 缓存里加了东西（2：标题，3：圈数、步数）：旧的缓存从头再读一遍，不然已经读过去的就数不到了
+const USAGE_CACHE_V = 4;   // 缓存里加了东西（2：标题，3：圈数、步数，4：模型名）：旧的缓存从头再读一遍，不然已经读过去的就数不到了
 
 /**
  * @param {unknown} path @param {string} [cacheFile]
- * @returns {{ ctx: number, out: number, laps: number, steps: number, title?: string, titleNew?: true } | undefined}
+ * @returns {{ ctx: number, out: number, laps: number, steps: number, model?: string, title?: string, titleNew?: true } | undefined}
  *   titleNew：这次读到的标题和上次读到的不一样（包括第一次读到）
  */
 export function usageFromTranscript(path, cacheFile) {
   if (!str(path)) return undefined;
-  /** @type {{ v: number, path: string, off: number, out: number, ctx: number, ids: string[], laps: number, steps: number, tools: string[], ai: string, custom: string }} */
-  let st = { v: USAGE_CACHE_V, path: /** @type {string} */ (path), off: 0, out: 0, ctx: 0, ids: [], laps: 0, steps: 0, tools: [], ai: "", custom: "" };
+  /** @type {{ v: number, path: string, off: number, out: number, ctx: number, ids: string[], laps: number, steps: number, tools: string[], model: string, ai: string, custom: string }} */
+  let st = { v: USAGE_CACHE_V, path: /** @type {string} */ (path), off: 0, out: 0, ctx: 0, ids: [], laps: 0, steps: 0, tools: [], model: "", ai: "", custom: "" };
   if (cacheFile) {
     try {
       const c = JSON.parse(readFileSync(cacheFile, "utf8"));
       if (c && c.v === USAGE_CACHE_V && c.path === path && Number.isInteger(c.off) && c.off >= 0 && Array.isArray(c.ids) && Array.isArray(c.tools)) {
         st = { ...st, ...c, out: tokN(c.out), ctx: tokN(c.ctx), laps: tokN(c.laps), steps: tokN(c.steps),
-               ai: str(c.ai) ? c.ai : "", custom: str(c.custom) ? c.custom : "" };
+               model: isModel(c.model) ? c.model : "", ai: str(c.ai) ? c.ai : "", custom: str(c.custom) ? c.custom : "" };
       }
     } catch { /* 第一次 */ }
   }
@@ -468,7 +481,7 @@ export function usageFromTranscript(path, cacheFile) {
   try {
     fd = openSync(/** @type {string} */ (path), "r");
     const size = fstatSync(fd).size;
-    if (size < st.off) st = { ...st, off: 0, out: 0, ctx: 0, ids: [], laps: 0, steps: 0, tools: [], ai: "", custom: "" };   // 文件被换掉了：从头读
+    if (size < st.off) st = { ...st, off: 0, out: 0, ctx: 0, ids: [], laps: 0, steps: 0, tools: [], model: "", ai: "", custom: "" };   // 文件被换掉了：从头读
     const seen = new Set(st.ids), seenTools = new Set(st.tools);
     let pos = st.off, rest = Buffer.alloc(0);
     while (pos < size) {
@@ -498,6 +511,7 @@ export function usageFromTranscript(path, cacheFile) {
         const ctx = tokN(u.input_tokens) + tokN(u.cache_read_input_tokens) + tokN(u.cache_creation_input_tokens);
         if (ctx) st.ctx = Math.min(MAX_TOK, ctx);
         const real = m.model !== "<synthetic>";
+        if (real && isModel(m.model)) st.model = m.model;
         // 同一条回答拆成好几行，每行一块内容：工具调用按它自己的编号数
         if (real && Array.isArray(m.content)) {
           for (const b of m.content) {
@@ -519,15 +533,11 @@ export function usageFromTranscript(path, cacheFile) {
     if (fd !== undefined) try { closeSync(fd); } catch { /* ignore */ }
   }
   if (cacheFile && st.off !== start) {
-    try {
-      const tmp = `${cacheFile}.${process.pid}.tmp`;
-      writeFileSync(tmp, JSON.stringify(st), { mode: 0o600 });
-      renameSync(tmp, cacheFile);
-    } catch { /* 写不了：下次从头读 */ }
+    try { writeAtomic(cacheFile, JSON.stringify(st)); } catch { /* 写不了：下次从头读 */ }
   }
   const title = st.custom || st.ai;
-  if (!st.ctx && !st.out && !st.laps && !title) return undefined;
-  return { ctx: st.ctx, out: st.out, laps: st.laps, steps: st.steps, ...(title ? { title } : {}), ...(title && title !== titleBefore ? { titleNew: /** @type {true} */ (true) } : {}) };
+  if (!st.ctx && !st.out && !st.laps && !st.model && !title) return undefined;
+  return { ctx: st.ctx, out: st.out, laps: st.laps, steps: st.steps, ...(st.model ? { model: st.model } : {}), ...(title ? { title } : {}), ...(title && title !== titleBefore ? { titleNew: /** @type {true} */ (true) } : {}) };
 }
 
 /** 读到哪里的记录：数据目录下 usage/<哈希后的会话编号>.json，只在本机 @param {string} dir @param {string} sid */
@@ -556,10 +566,16 @@ const KEY_IN_TEXT = /(\bk=)[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])/g;
  * @param {any} hook @returns {any}
  */
 export function scrubKeys(hook) {
+  return scrubbed(hook).hook;
+}
+
+/** scrubKeys，顺带给出抹完以后的 JSON 文本（序列化不了是 ""） @param {any} hook @returns {{ hook: any, text: string }} */
+function scrubbed(hook) {
   let text;
-  try { text = JSON.stringify(hook); } catch { return hook; }
-  if (!text || text.search(KEY_IN_TEXT) < 0) return hook;
-  return JSON.parse(text.replace(KEY_IN_TEXT, "$1…"));
+  try { text = JSON.stringify(hook); } catch { return { hook, text: "" }; }
+  if (!text || text.search(KEY_IN_TEXT) < 0) return { hook, text: text ?? "" };
+  text = text.replace(KEY_IN_TEXT, "$1…");
+  return { hook: JSON.parse(text), text };
 }
 
 /**
@@ -569,12 +585,13 @@ export function scrubKeys(hook) {
  * @param {any} hook 原始 hook 数据
  * @param {{ salt: string, level: Level, local?: boolean, key?: Buffer, gid?: string, me?: string, projectDir?: string, now?: number,
  *           readModel?: (path: unknown) => string | undefined,
- *           readUsage?: (path: unknown, sid: string) => { ctx: number, out: number, laps?: number, steps?: number, title?: string, titleNew?: true } | undefined }} ctx
+ *           readUsage?: (path: unknown, sid: string) => { ctx: number, out: number, laps?: number, steps?: number, model?: string, title?: string, titleNew?: true } | undefined }} ctx
  * @returns {OutEvent | null}
  */
 export function buildEvent(hook, ctx) {
   if (!hook || typeof hook !== "object") return null;
-  hook = scrubKeys(hook);
+  const clean = scrubbed(hook);
+  hook = clean.hook;
   const name = hook.hook_event_name;
   if (!EVENT_NAMES.includes(name) || !str(hook.session_id)) return null;
   const H = (/** @type {string} */ v) => hash16(ctx.salt, v);
@@ -593,37 +610,35 @@ export function buildEvent(hook, ctx) {
       && isFinite(hook.duration_ms) && hook.duration_ms >= 0) out.duration_ms = Math.min(1e9, Math.round(hook.duration_ms));
   if (name === "PostToolUseFailure" && hook.is_interrupt === true) out.interrupt = true;
   if (name === "SessionStart" && SESSION_SOURCES.includes(hook.source)) out.source = hook.source;
+  // 会话记录里的 token 数、圈数、步数、模型名、标题：只看主对话
+  const u = (name === "SessionStart" || name === "Stop" || name === "PostToolBatch" || name === "UserPromptSubmit") && !out.agent && ctx.readUsage
+    ? ctx.readUsage(hook.transcript_path, out.sid) : undefined;
   if (name === "SessionStart" || name === "Stop") {
-    if (typeof hook.model === "string" && hook.model.length <= 80 && MODEL_RE.test(hook.model)) out.model = hook.model;
+    // 模型名：hook 数据给了就用；没给先用上面读到的；还没有（子 agent 的事件、主对话还没回答过）再读记录末尾
+    if (isModel(hook.model)) out.model = hook.model;
+    else if (u && isModel(u.model)) out.model = u.model;
     else if (ctx.readModel) { const mdl = ctx.readModel(hook.transcript_path); if (mdl) out.model = mdl; }
   }
   /** 对话的标题（会话记录里 Claude Code 起的）：附件，下面按档位附上 @type {string} */
   let title = "";
-  if ((name === "SessionStart" || name === "Stop" || name === "PostToolBatch" || name === "UserPromptSubmit") && !out.agent && ctx.readUsage) {
-    const u = ctx.readUsage(hook.transcript_path, out.sid);
+  if (u) {
     // token 数：只是两个数，和模型名一样原样发
-    if (u && name !== "UserPromptSubmit") { if (u.ctx) out.ctx_tok = u.ctx; if (u.out) out.out_tok = u.out; }
+    if (name !== "UserPromptSubmit") { if (u.ctx) out.ctx_tok = u.ctx; if (u.out) out.out_tok = u.out; }
     // 记录里已有的圈数、步数：也只是两个数。每圈结束时不带（那时记录里有正在跑的这一圈，服务器只在没有圈在跑时用它）
-    if (u && name !== "PostToolBatch") { if (u.laps) out.laps = u.laps; if (u.steps) out.steps = u.steps; }
+    if (name !== "PostToolBatch") { if (u.laps) out.laps = u.laps; if (u.steps) out.steps = u.steps; }
     // 标题：会话开始、每次提问、每次回答完都带上（服务器重启过也能补回来）；每一圈结束时只在它变了的时候带
-    if (u && u.title && (name !== "PostToolBatch" || u.titleNew)) title = u.title;
+    if (u.title && (name !== "PostToolBatch" || u.titleNew)) title = u.title;
   }
   if (name === "Notification" && NOTIFICATION_TYPES.includes(hook.notification_type)) out.ntype = hook.notification_type;
   if (name === "Stop") out.bg = Array.isArray(hook.background_tasks) ? Math.min(1000, hook.background_tasks.length) : 0;
   if (name === "StopFailure") out.err_kind = errorKind(hook.error);
-  if (name === "SubagentStart" || name === "SubagentStop") {
-    const t = str(hook.agent_type) ? hook.agent_type : "";
-    if (t) {
-      out.agent_type = BUILTIN_AGENT_TYPES.includes(t) ? t : "custom";
-      out.agent_type_h = H("agent-type:" + t);
-    }
-  }
+  // 子 agent 的类型和它的哈希：派遣（PreToolUse）和起来的子 agent 算的必须一样，服务器靠它配对
+  const agentType = (/** @type {string} */ t) => { out.agent_type = BUILTIN_AGENT_TYPES.includes(t) ? t : "custom"; out.agent_type_h = H("agent-type:" + t); };
+  if ((name === "SubagentStart" || name === "SubagentStop") && str(hook.agent_type)) agentType(hook.agent_type);
   if (name === "PreToolUse" && out.kind === "agent" && !out.agent) {
-    // 派子 agent：对要派的类型算同样的哈希，服务器用它把起来的子 agent 配对到这一次派遣上。没写类型就是 general-purpose
+    // 派子 agent：对要派的类型算同样的哈希。没写类型就是 general-purpose
     const inp = hook.tool_input && typeof hook.tool_input === "object" ? hook.tool_input : {};
-    const t = str(inp.subagent_type) ? inp.subagent_type : "general-purpose";
-    out.agent_type = BUILTIN_AGENT_TYPES.includes(t) ? t : "custom";
-    out.agent_type_h = H("agent-type:" + t);
+    agentType(str(inp.subagent_type) ? inp.subagent_type : "general-purpose");
   }
   if (name === "UserPromptSubmit") {
     // 输入的话只留一个布尔值：是不是后台任务（或后台子 agent）跑完的通知
@@ -655,11 +670,55 @@ export function buildEvent(hook, ctx) {
     if (t && ctx.local) out.title = t;
     else if (t && ctx.key) out.enc_title = seal(ctx.key, t, aadOf("title", out.sid, ""));
   }
-  if (ctx.local && ctx.level === 2) {
-    const text = JSON.stringify(hook);
-    out.raw = text.length > RAW_MAX_BYTES ? clipDeep(hook, 2000) : hook;
-  }
+  if (ctx.local && ctx.level === 2) out.raw = clean.text.length > RAW_MAX_BYTES ? clipDeep(hook, 2000) : hook;
   return out;
+}
+
+// ---- 插件数据目录里的小文件（server.json、left.json、moved.json、stale.json、sweep.json、status.json、hello.json）
+
+/** 先写临时文件再换上去：同时跑的 hook 读不到写了一半的文件。写不了就抛出 @param {string} file @param {string} text */
+function writeAtomic(file, text) {
+  const tmp = `${file}.${process.pid}.tmp`;
+  writeFileSync(tmp, text, { mode: 0o600 });
+  renameSync(tmp, file);
+}
+
+/** 读 <dir>/<name>，没有或读不懂返回 null @param {string} dir @param {string} name @returns {any} */
+function readJson(dir, name) {
+  try { return JSON.parse(readFileSync(join(dir, name), "utf8")); } catch { return null; }
+}
+
+/** 写 <dir>/<name>（权限 0600）。写不了就抛出 @param {string} dir @param {string} name @param {unknown} value */
+function writeJson(dir, name, value) {
+  mkdirSync(dir, { recursive: true });
+  writeAtomic(join(dir, name), JSON.stringify(value) + "\n");
+}
+
+/** 星系群编号 */
+const GROUP_RE = /^[0-9a-f]{32}$/;
+
+/**
+ * 存在 <dir>/<name> 的 { [field]: string[] } 里的一组记号（最多 max 个，新的在后面）：left.json、moved.json、hello.json
+ * @param {string} name @param {string} field @param {number} max @param {(x: string) => boolean} ok
+ */
+function markList(name, field, max, ok) {
+  /** @param {string} dir @returns {string[]} */
+  const list = dir => {
+    const g = readJson(dir, name)?.[field];
+    return Array.isArray(g) ? g.filter(x => typeof x === "string" && ok(x)) : [];
+  };
+  return {
+    list,
+    /** 记下（on）或者去掉（!on）一个记号。没变就不写，返回 false；写不了就抛出 @param {string} dir @param {string} key @param {boolean} on */
+    set(dir, key, on) {
+      const was = list(dir);
+      if (was.includes(key) === on) return false;
+      const now = was.filter(x => x !== key);
+      if (on) now.push(key);
+      writeJson(dir, name, { [field]: now.slice(-max) });
+      return true;
+    },
+  };
 }
 
 // ---- 身份
@@ -737,30 +796,20 @@ export function parseTarget(v) {
   return { url: base || DEFAULT_SERVER_URL, k: m ? m[1] : null };
 }
 
-/** userConfig 的 server_url 里的服务器地址（不含 #k=）；没设过就用默认的本机地址 */
-export function serverUrl(env = process.env) {
-  return settings(env).target.url;
-}
-
 /**
  * 记下最近一次用的 server_url，给 /galaxy 用：server_url 是敏感设置（邀请链接里有密钥），存在系统的凭据存储里，
  * 命令正文里拿不到（docs/step0-findings.md）。文件在插件数据目录里，权限 0600，和安装密钥放在一起。变了才写
  * @param {string} dir @param {string} value
  */
 export function rememberTarget(dir, value) {
-  const file = join(dir, "server.json");
-  try { if (JSON.parse(readFileSync(file, "utf8")).server_url === value) return; } catch { /* 还没有 */ }
-  try {
-    mkdirSync(dir, { recursive: true });
-    const tmp = `${file}.${process.pid}.tmp`;
-    writeFileSync(tmp, JSON.stringify({ server_url: value }) + "\n", { mode: 0o600 });
-    renameSync(tmp, file);
-  } catch { /* 写不了：/galaxy 退回默认地址 */ }
+  if (rememberedTarget(dir) === value) return;
+  try { writeJson(dir, "server.json", { server_url: value }); } catch { /* 写不了：/galaxy 退回默认地址 */ }
 }
 
 /** @param {string} dir @returns {string} */
 function rememberedTarget(dir) {
-  try { const v = JSON.parse(readFileSync(join(dir, "server.json"), "utf8")).server_url; return typeof v === "string" ? v : ""; } catch { return ""; }
+  const v = readJson(dir, "server.json")?.server_url;
+  return typeof v === "string" ? v : "";
 }
 
 // ---- 退出星系群（/agent-loop:leave）
@@ -769,26 +818,13 @@ function rememberedTarget(dir) {
 // 每个 hook 发送前都看：目标是退出过的群就不发。这样所有窗口里的会话立刻都停，不用重载；
 // 改设置以前开的旧会话拿着旧的邀请链接，也不会把星系又带回群里。想回去用 /agent-loop:rejoin。
 
-const LEFT_MAX = 20;
+const LEFT = markList("left.json", "groups", 20, x => GROUP_RE.test(x));
 
 /** 退出过的星系群编号 @param {string} dir @returns {string[]} */
-export function leftGroups(dir) {
-  try {
-    const g = JSON.parse(readFileSync(join(dir, "left.json"), "utf8")).groups;
-    return Array.isArray(g) ? g.filter(x => typeof x === "string" && /^[0-9a-f]{32}$/.test(x)) : [];
-  } catch { return []; }
-}
+export const leftGroups = LEFT.list;
 
-/** 记下（on）或者去掉（!on）一个退出过的星系群 @param {string} dir @param {string} group @param {boolean} on */
-export function markLeft(dir, group, on) {
-  const now = leftGroups(dir).filter(g => g !== group);
-  if (on) now.push(group);
-  const file = join(dir, "left.json");
-  mkdirSync(dir, { recursive: true });
-  const tmp = `${file}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify({ groups: now.slice(-LEFT_MAX) }) + "\n", { mode: 0o600 });
-  renameSync(tmp, file);
-}
+/** 记下（on）或者去掉（!on）一个退出过的星系群。写不了就抛出 @param {string} dir @param {string} group @param {boolean} on */
+export const markLeft = (dir, group, on) => void LEFT.set(dir, group, on);
 
 /** 星系群的指纹：编号开头 16 个字符，四个一组（和页面上的一样，用来核对是哪个群） @param {string} group */
 export const fingerprint = group => (group.slice(0, 16).match(/.{1,4}/g) ?? []).join(" ");
@@ -816,11 +852,10 @@ export async function sendLeave(url, secret, access) {
  * @returns {Promise<string>}
  */
 export async function leaveOrRejoin(what, dir, value, open = null) {
-  const target = parseTarget(value);
-  const keys = target.k ? deriveKeys(target.k) : null;
-  const how = "To report to this computer instead, set server_url back to http://127.0.0.1:4317 with /plugin configure agent-loop@agent-loop.";
-  if (isLocal(target.url) || !keys) return `Not in a galaxy group: server_url is ${target.url}${target.k ? " (with an incomplete invite link)" : ""}. Nothing to ${what === "leave" ? "leave" : "rejoin"}.`;
-  const fp = fingerprint(keys.group), left = leftGroups(dir).includes(keys.group);
+  const target = resolveTarget(dir, value), keys = target.keys, left = target.block === "left";
+  // 本机地址不算在群里；只有带着 #k= 又退出过（hook 照样不发，见 resolveTarget）时也认：不然 rejoin 回不去
+  if (!keys || (target.local && !left)) return `Not in a galaxy group: server_url is ${target.url}${target.k && !keys ? " (with an incomplete invite link)" : ""}. Nothing to ${what === "leave" ? "leave" : "rejoin"}.`;
+  const fp = fingerprint(keys.group);
   if (what === "rejoin") {
     if (!left) return `Already in galaxy group ${fp} on ${target.url}: this computer is reporting to it.`;
     markLeft(dir, keys.group, false);
@@ -838,7 +873,7 @@ export async function leaveOrRejoin(what, dir, value, open = null) {
       page = 'Opened the group\'s page in your browser: it clears this group\'s key from that browser and shows that you left. Other browsers that opened the invite link can still watch the group until they choose "Clear cache" under Invite on the page.';
   }
   return `Left galaxy group ${fp} on ${target.url}. No session on this computer reports to it any more (no reload needed). ${server}\n` +
-    `server_url still holds the invite link. ${how} To rejoin this group later, run /agent-loop:rejoin. ${page}`;
+    `server_url still holds the invite link. ${BACK_HOME} To rejoin this group later, run /agent-loop:rejoin. ${page}`;
 }
 
 // ---- 换过群：旧设置的会话不再发（moved.json）
@@ -848,65 +883,93 @@ export async function leaveOrRejoin(what, dir, value, open = null) {
 // 改回旧链接。所以 --welcome 把旧的目标记下来，拿着它的 hook 不发、不记地址。
 // 新开的会话（SessionStart 的 startup）拿的一定是当前的设置：它还是旧值，说明用户又改回去了，去掉记号照常发。
 
-const MOVED_MAX = 20;
+const MOVED = markList("moved.json", "from", 20, x => x.length <= 400);
 
 /** 一个目标的记号：星系群用群编号，别的用地址 @param {{ url: string, k: string | null }} target */
 export function targetKey(target) {
   const keys = target.k ? deriveKeys(target.k) : null;
-  return keys ? `g:${keys.group}` : `u:${target.url}`;
+  return markOf(target.url, keys ? keys.group : null);
 }
+/** @param {string} url @param {string | null} group */
+const markOf = (url, group) => group ? `g:${group}` : `u:${url}`;
 
 /** 换走了的目标（targetKey） @param {string} dir @returns {string[]} */
-export function movedFrom(dir) {
-  try {
-    const g = JSON.parse(readFileSync(join(dir, "moved.json"), "utf8")).from;
-    return Array.isArray(g) ? g.filter(x => typeof x === "string" && x.length <= 400) : [];
-  } catch { return []; }
-}
+export const movedFrom = MOVED.list;
 
-/** 记下（on）或者去掉（!on）一个换走了的目标。没变就不写 @param {string} dir @param {string} key @param {boolean} on */
-export function markMoved(dir, key, on) {
-  const was = movedFrom(dir);
-  if (was.includes(key) === on) return;
-  const now = was.filter(g => g !== key);
-  if (on) now.push(key);
-  const file = join(dir, "moved.json");
-  mkdirSync(dir, { recursive: true });
-  const tmp = `${file}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify({ from: now.slice(-MOVED_MAX) }) + "\n", { mode: 0o600 });
-  renameSync(tmp, file);
-}
+/** 记下（on）或者去掉（!on）一个换走了的目标。没变就不写；写不了就抛出 @param {string} dir @param {string} key @param {boolean} on */
+export const markMoved = (dir, key, on) => void MOVED.set(dir, key, on);
 
 const STALE_EVERY_MS = 30_000;
-/** 记下「刚才还有旧设置的会话在跑」（hook 因为 staleTarget 没发）。/agent-loop:status 据此提醒 /reload-plugins。
+/** 记下「刚才还有旧设置的会话在跑」（hook 因为 resolveTarget 的 moved 没发）。/agent-loop:status 据此提醒 /reload-plugins。
  *  半分钟内记过就不再写 @param {string} dir @param {number} [now] */
 export function noteStale(dir, now = Date.now()) {
   if (now - staleSeen(dir) < STALE_EVERY_MS) return;
-  const file = join(dir, "stale.json");
-  try {
-    mkdirSync(dir, { recursive: true });
-    const tmp = `${file}.${process.pid}.tmp`;
-    writeFileSync(tmp, JSON.stringify({ at: now }) + "\n", { mode: 0o600 });
-    renameSync(tmp, file);
-  } catch { /* 写不了就算了 */ }
+  try { writeJson(dir, "stale.json", { at: now }); } catch { /* 写不了就算了 */ }
 }
 /** 上次看到旧设置的会话是什么时候（毫秒），没有是 0 @param {string} dir @returns {number} */
 export function staleSeen(dir) {
-  try { const t = JSON.parse(readFileSync(join(dir, "stale.json"), "utf8")).at; return typeof t === "number" && isFinite(t) ? t : 0; } catch { return 0; }
+  const t = readJson(dir, "stale.json")?.at;
+  return typeof t === "number" && isFinite(t) ? t : 0;
 }
 
+/** @param {any} hook */
+const isStartup = hook => !!hook && hook.hook_event_name === "SessionStart" && hook.source === "startup";
+
+// ---- 这个目标能不能报
+//
+// hook 发不发、--check 和命令说什么，都从 resolveTarget 的 block 来，规则只有这一份：
+//   moved  换走了的旧设置（moved.json）。只有 hook 算：新开的会话（SessionStart 的 startup）不算，命令里没有 hook 也不算
+//   scheme 地址不是 http:// 或 https:// 开头
+//   nokey  发往别处却没有邀请链接（#k=）
+//   badkey 邀请链接不完整（密钥不是 43 个字符）
+//   left   退出过这个星系群（left.json）。不管本机不本机：带着完整的 #k= 就派生密钥、查 left.json
+// 本机地址没有 #k=（或者 #k= 不完整）时不算在哪个群里，照常发明文
+
 /**
- * 这个 hook 拿的是换走了的旧设置：返回 true 表示不发。新开的会话拿着它时去掉记号（见上）
- * @param {string} dir @param {{ url: string, k: string | null }} target @param {any} hook
+ * @typedef {null | "moved" | "scheme" | "nokey" | "badkey" | "left"} Block
+ * @typedef {{ url: string, k: string | null, keys: ReturnType<typeof deriveKeys>, local: boolean, group: string | null, block: Block }} Resolved
  */
-export function staleTarget(dir, target, hook) {
-  const key = targetKey(target);
-  if (!movedFrom(dir).includes(key)) return false;
-  if (hook && hook.hook_event_name === "SessionStart" && hook.source === "startup") {
-    try { markMoved(dir, key, false); } catch { /* 写不了：这次照常发 */ }
-    return false;
+
+/**
+ * 只读（不写文件）。value 是 server_url 的值，或者已经拆开的（parseTarget）；hook 只有 hook 里给
+ * @param {string} dir @param {string | { url: string, k: string | null }} value @param {any} [hook] @returns {Resolved}
+ */
+export function resolveTarget(dir, value, hook) {
+  const { url, k } = typeof value === "string" ? parseTarget(value) : value;
+  const local = isLocal(url), keys = k ? deriveKeys(k) : null, group = keys ? keys.group : null;
+  /** @type {Block} */
+  let block = null;
+  if (hook !== undefined && !isStartup(hook) && movedFrom(dir).includes(markOf(url, group))) block = "moved";
+  else if (!hasScheme(url)) block = "scheme";
+  else if (!local && !k) block = "nokey";
+  else if (!local && !keys) block = "badkey";
+  else if (group && leftGroups(dir).includes(group)) block = "left";
+  return { url, k, keys, local, group, block };
+}
+
+/** 想改回本机时怎么改（几处提示都用这一句） */
+const BACK_HOME = `To report to this computer instead, set server_url back to ${DEFAULT_SERVER_URL} with /plugin configure ${PLUGIN_ID}.`;
+/** 设置不对时怎么改 */
+const FIX_LINK = "Paste the whole invite link (…/#k=…) into the Agent Loop plugin's server_url setting, then run /reload-plugins.";
+
+/**
+ * 不能报时的那句话（英文，不带开头：hook 的提示前面加「Agent Loop is not reporting: 」，命令各有各的开头）。
+ * 会显示在 Claude Code 里、进对话：只有服务器地址和指纹，不带密钥
+ * @param {Exclude<Block, null>} block @param {Resolved} target @returns {string}
+ */
+export function blockMessage(block, target) {
+  const { url } = target;
+  switch (block) {
+    case "moved":
+      return `this session still has the old server_url (${url}) from before you joined another galaxy group, so it is not reporting. Run /reload-plugins to switch it over. (If you switched back to ${url} on purpose, open a new session.)`;
+    // 漏了 http://：不替人补（补错成 http:// 会把口令明文发出去），照实说
+    case "scheme": return `server_url must start with http:// or https:// (it is "${url}"). ${FIX_LINK}`;
+    case "nokey": return `server_url points to ${url} but has no group key. ${FIX_LINK}`;
+    case "badkey": return `the invite link in server_url is incomplete (the key after #k= must be 43 characters). ${FIX_LINK}`;
+    case "left":
+      return `you left galaxy group ${fingerprint(target.group ?? "")} on ${url} with /agent-loop:leave, so this computer sends nothing to it and your galaxy is not shown there. ` +
+        `To go back to that group, run /agent-loop:rejoin. ${BACK_HOME}`;
   }
-  return true;
 }
 
 /**
@@ -919,16 +982,11 @@ export function staleTarget(dir, target, hook) {
 async function endInCurrent(dir, hook, share, me) {
   const value = rememberedTarget(dir);
   if (!value) return;
-  const target = parseTarget(value), local = isLocal(target.url);
-  const keys = target.k ? deriveKeys(target.k) : null;
-  if (!hasScheme(target.url) || (!local && !keys) || movedFrom(dir).includes(targetKey(target))) return;
-  if (keys && leftGroups(dir).includes(keys.group)) return;
-  const { secret, salt } = loadIdentity(dir);
-  const ev = buildEvent(hook, {
-    salt, level: shareLevel(share, local), local, key: keys?.content, gid: galaxyId(secret), me,
-    projectDir: process.env.CLAUDE_PROJECT_DIR,
-  });
-  if (ev) await send(target.url, secret, ev, SESSION_END_TIMEOUT_MS, keys?.access);
+  const target = resolveTarget(dir, value, hook);
+  if (target.block) return;
+  const r = reporter(dir, target, { share, me, projectDir: process.env.CLAUDE_PROJECT_DIR });
+  const ev = r.build(hook);
+  if (ev) await r.send(ev, SESSION_END_TIMEOUT_MS);
 }
 
 // ---- 替结束了却没送出 SessionEnd 的会话补发（sweep.json）
@@ -936,9 +994,12 @@ async function endInCurrent(dir, hook, share, me) {
 // SessionEnd 送不到的会话（点 × 关了窗口、进程崩了、发送超时、旧版插件把它拦下了、服务器升级后不收旧格式）在群里要挂两个
 // 小时才被服务器移除，看着像多了一个会话。那个会话自己已经不在了，只能由还活着的会话（跑着新插件）替它发，服务器新旧都认。
 // Claude Code 在 <配置目录>/sessions/<进程号>.json 里登记正在跑的会话（交互的和 claude -p 都有，正常退出时删掉）：
-// 不在登记里、或者登记的进程已经没了的，就是结束了。候选是最近两小时（服务器移除会话的时间）动过的会话记录。
+// 不在登记里、或者登记的进程已经没了的，就是结束了。候选是插件报过（usage/ 缓存里有）、最近两小时（服务器移除会话的时间）动过的会话记录。
 // 登记是 Claude Code 内部的文件，所以很保守：登记里找不到自己这个会话（这个版本不登记、换了格式）、有登记读不懂，就不扫；
 // 记录刚动过不到一分钟的不算（可能刚开、还没登记）。宁可不清，不能把开着的会话从页面上拿掉
+
+/** Claude Code 的会话编号（会话记录的文件名） */
+const SID_RE = /^[A-Za-z0-9-]{1,80}$/;
 
 const SWEEP_EVERY_MS = 60_000, SWEEP_QUIET_MS = 60_000, SWEEP_WINDOW_MS = 2 * 3600_000, SWEEP_MAX = 30;
 
@@ -971,29 +1032,33 @@ export function liveSessions(cfg, isAlive = alive) {
 }
 
 /**
- * 最近 SWEEP_WINDOW_MS 内动过、又安静了 SWEEP_QUIET_MS 以上的会话（会话记录 <配置目录>/projects/<任意>/<编号>.jsonl）和记录最后动的时间
- * @param {string} cfg @param {number} now @returns {{ sid: string, mtime: number }[]}
+ * 最近 SWEEP_WINDOW_MS 内动过、又安静了 SWEEP_QUIET_MS 以上的会话和记录最后动的时间。
+ * 候选只从插件自己的 usage/ 缓存来（插件报过的会话；没报过的服务器上本来就没有，不用补）：缓存里记着会话记录的路径，
+ * 文件名 <编号>.jsonl 就是原始会话编号。缓存本身 SWEEP_WINDOW_MS 以前就没动过的不看，剩下的才 stat 会话记录
+ * @param {string} dir 插件数据目录 @param {number} now @returns {{ sid: string, mtime: number }[]}
  */
-export function recentSessions(cfg, now) {
-  const root = join(cfg, "projects");
+export function recentSessions(dir, now) {
+  const root = join(dir, "usage");
   /** @type {{ sid: string, mtime: number }[]} */
   const out = [];
+  const seen = new Set();
   /** @type {string[]} */
-  let dirs;
-  try { dirs = readdirSync(root); } catch { return out; }
-  for (const d of dirs) {
-    /** @type {string[]} */
-    let files;
-    try { files = readdirSync(join(root, d)); } catch { continue; }
-    for (const f of files) {
-      if (!f.endsWith(".jsonl")) continue;
-      const sid = f.slice(0, -6);
-      if (!/^[A-Za-z0-9-]{1,80}$/.test(sid)) continue;
-      try {
-        const mtime = statSync(join(root, d, f)).mtimeMs, age = now - mtime;
-        if (age < SWEEP_WINDOW_MS && age > SWEEP_QUIET_MS) out.push({ sid, mtime });
-      } catch { /* 刚被删 */ }
-    }
+  let files;
+  try { files = readdirSync(root); } catch { return out; }
+  for (const f of files) {
+    if (!f.endsWith(".json")) continue;
+    try {
+      const file = join(root, f);
+      if (now - statSync(file).mtimeMs >= SWEEP_WINDOW_MS) continue;
+      const path = JSON.parse(readFileSync(file, "utf8"))?.path;
+      if (!str(path)) continue;
+      const name = basename(path);
+      if (!name.endsWith(".jsonl")) continue;
+      const sid = name.slice(0, -6);
+      if (!SID_RE.test(sid) || seen.has(sid)) continue;
+      const mtime = statSync(path).mtimeMs, age = now - mtime;
+      if (age < SWEEP_WINDOW_MS && age > SWEEP_QUIET_MS) { seen.add(sid); out.push({ sid, mtime }); }
+    } catch { /* 缓存读不懂、记录没了：不算 */ }
   }
   return out;
 }
@@ -1001,22 +1066,13 @@ export function recentSessions(cfg, now) {
 /** 上次扫的时间；补发过的会话 → 补发时它的记录最后动的时间（之后又 --resume 过、又动了，就再补一次）
  *  @param {string} dir @returns {{ at: number, done: Record<string, number> }} */
 function readSweep(dir) {
-  try {
-    const o = JSON.parse(readFileSync(join(dir, "sweep.json"), "utf8"));
-    const done = o && typeof o.done === "object" && o.done ? o.done : {};
-    return { at: typeof o.at === "number" ? o.at : 0, done };
-  } catch { return { at: 0, done: {} }; }
+  const o = readJson(dir, "sweep.json");
+  return { at: typeof o?.at === "number" ? o.at : 0, done: o && typeof o.done === "object" && o.done ? o.done : {} };
 }
 
 /** @param {string} dir @param {{ at: number, done: Record<string, number> }} s */
 function writeSweep(dir, s) {
-  const file = join(dir, "sweep.json");
-  try {
-    mkdirSync(dir, { recursive: true });
-    const tmp = `${file}.${process.pid}.tmp`;
-    writeFileSync(tmp, JSON.stringify(s) + "\n", { mode: 0o600 });
-    renameSync(tmp, file);
-  } catch { /* 写不了：下次再扫一遍，服务器对没有的会话的 SessionEnd 什么都不做 */ }
+  try { writeJson(dir, "sweep.json", s); } catch { /* 写不了：下次再扫一遍，服务器对没有的会话的 SessionEnd 什么都不做 */ }
 }
 
 /**
@@ -1033,7 +1089,7 @@ export async function sweepEnded({ dir, cfg, self, end, now = Date.now(), isAliv
   const live = liveSessions(cfg, isAlive);
   if (!live || !live.has(self)) return [];
   for (const [sid, t] of Object.entries(state.done)) if (typeof t !== "number" || now - t > SWEEP_WINDOW_MS) delete state.done[sid];
-  const gone = recentSessions(cfg, now)
+  const gone = recentSessions(dir, now)
     .filter(x => x.sid !== self && !live.has(x.sid) && !(state.done[x.sid] >= x.mtime)).slice(0, SWEEP_MAX);
   for (const x of gone) state.done[x.sid] = x.mtime;
   state.at = now;
@@ -1041,10 +1097,6 @@ export async function sweepEnded({ dir, cfg, self, end, now = Date.now(), isAliv
   await Promise.all(gone.map(x => end(x.sid).catch(() => {})));
   return gone.map(x => x.sid);
 }
-
-/** 旧设置的会话里说话、/clear 时提示一行。不带密钥 @param {string} url */
-export const staleMessage = url =>
-  `Agent Loop: this session still has the old server_url (${url}) from before you joined another galaxy group, so it is not reporting. Run /reload-plugins to switch it over. (If you switched back to ${url} on purpose, open a new session.)`;
 
 // ---- 上报不出去时告诉用户
 //
@@ -1056,22 +1108,20 @@ export const staleMessage = url =>
  * @param {string} dir @param {string} url 服务器地址（不含 #k=） @param {number | "unreachable"} status
  */
 export function recordStatus(dir, url, status) {
-  const file = join(dir, "status.json");
-  try { const d = JSON.parse(readFileSync(file, "utf8")); if (d.url === url && d.status === status) return; } catch { /* 还没有 */ }
-  try {
-    mkdirSync(dir, { recursive: true });
-    const tmp = `${file}.${process.pid}.tmp`;
-    writeFileSync(tmp, JSON.stringify({ url, status }) + "\n", { mode: 0o600 });
-    renameSync(tmp, file);
-  } catch { /* 写不了就算了 */ }
+  const d = lastStatus(dir);
+  if (d && d.url === url && d.status === status) return;
+  try { writeJson(dir, "status.json", { url, status }); } catch { /* 写不了就算了 */ }
 }
 
 /** @param {string} dir @returns {{ url: string, status: number | "unreachable" } | null} */
 export function lastStatus(dir) {
-  try {
-    const d = JSON.parse(readFileSync(join(dir, "status.json"), "utf8"));
-    return typeof d.url === "string" && (typeof d.status === "number" || d.status === "unreachable") ? d : null;
-  } catch { return null; }
+  const d = readJson(dir, "status.json");
+  return d && typeof d.url === "string" && (typeof d.status === "number" || d.status === "unreachable") ? d : null;
+}
+
+/** 现在的设置或者上次的发送有没有问题（见 reportProblem），Node 太旧优先 @param {string} dir @param {Resolved} target */
+export function currentProblem(dir, target) {
+  return nodeProblem(process.versions.node) ?? reportProblem(target, lastStatus(dir));
 }
 
 /** 插件要的最低 Node 版本（自带的 fetch、AbortSignal.timeout） */
@@ -1091,31 +1141,21 @@ export const hasScheme = url => /^https?:\/\//i.test(url);
 /**
  * 设置或者上次的发送有没有问题。没问题返回 null；有问题返回给用户看的一行字（英文，和插件别的输出一样）。
  * 这行字会显示在 Claude Code 里，也可能进对话：不能带密钥
- * @param {{ url: string, k: string | null }} target @param {{ url: string, status: number | "unreachable" } | null} last
- * @param {string[]} [left] 退出过的星系群编号（leftGroups）
+ * @param {Resolved} target resolveTarget 的结果 @param {{ url: string, status: number | "unreachable" } | null} last
  */
-export function reportProblem(target, last, left = []) {
-  const { url, k } = target;
-  const fix = "Paste the whole invite link (…/#k=…) into the Agent Loop plugin's server_url setting, then run /reload-plugins.";
-  // 漏了 http://：不替人补（补错成 http:// 会把口令明文发出去），照实说
-  if (!hasScheme(url)) return `Agent Loop is not reporting: server_url must start with http:// or https:// (it is "${url}"). ${fix}`;
-  if (!isLocal(url)) {
-    if (!k) return `Agent Loop is not reporting: server_url points to ${url} but has no group key. ${fix}`;
-    const keys = deriveKeys(k);
-    if (!keys) return `Agent Loop is not reporting: the invite link in server_url is incomplete (the key after #k= must be 43 characters). ${fix}`;
-    if (left.includes(keys.group)) {
-      return `Agent Loop is not reporting: you left galaxy group ${fingerprint(keys.group)} with /agent-loop:leave. To report to this computer, set server_url back to http://127.0.0.1:4317 with /plugin configure agent-loop@agent-loop; to rejoin, run /agent-loop:rejoin.`;
-    }
-  }
+export function reportProblem(target, last) {
+  const { url, block } = target;
+  if (block === "moved") return `Agent Loop: ${blockMessage(block, target)}`;
+  if (block) return `Agent Loop is not reporting: ${blockMessage(block, target)}`;
   // 上次的结果只对同一个地址算数：换过地址就等下一次发送
   if (!last || last.url !== url) return null;
   const s = last.status;
   if (s === "unreachable") {
-    return isLocal(url)
+    return target.local
       ? `Agent Loop could not reach ${url} last time. To watch on this computer, run \`npx agent-loop\`. To join a galaxy group instead, paste its invite link (…/#k=…) into the plugin's server_url setting.`
       : `Agent Loop could not reach ${url} last time. Check that the server is running and reachable from this computer.`;
   }
-  if (s === 401 || s === 403) return `Agent Loop: ${url} refused the reports (HTTP ${s}). The invite link may be wrong, or this server only accepts certain galaxy groups. ${fix}`;
+  if (s === 401 || s === 403) return `Agent Loop: ${url} refused the reports (HTTP ${s}). The invite link may be wrong, or this server only accepts certain galaxy groups. ${FIX_LINK}`;
   if (s === 400) return `Agent Loop: ${url} rejected the reports (HTTP 400). The plugin and the server may be different versions: update the plugin.`;
   return null;
 }
@@ -1127,16 +1167,11 @@ export function reportProblem(target, last, left = []) {
 // 让它顺带讲一遍会分享什么、怎么加密，问要不要改名字和分享多少。每个星系群只讲一次，记在插件数据目录的 hello.json 里。
 // 这段会进对话、发给模型：只有服务器地址和指纹，不带密钥
 
-const HELLO_MAX = 20;
+const HELLO = markList("hello.json", "groups", 20, x => GROUP_RE.test(x));
 export const PLUGIN_REPO = "https://github.com/sacryu/agent-loop-plugin";
 
 /** 讲过的星系群编号 @param {string} dir @returns {string[]} */
-export function helloGroups(dir) {
-  try {
-    const g = JSON.parse(readFileSync(join(dir, "hello.json"), "utf8")).groups;
-    return Array.isArray(g) ? g.filter(x => typeof x === "string" && /^[0-9a-f]{32}$/.test(x)) : [];
-  } catch { return []; }
-}
+export const helloGroups = HELLO.list;
 
 /** 每一档分享的内容（给 Claude 讲用），按 shareLevel 的 0、1、2 */
 const SHARE_WHAT = [
@@ -1150,15 +1185,7 @@ const SHARE_WHAT = [
  * @param {string} dir @param {string} group
  */
 function claimHello(dir, group) {
-  const done = helloGroups(dir);
-  if (done.includes(group)) return false;
-  try {
-    mkdirSync(dir, { recursive: true });
-    const file = join(dir, "hello.json"), tmp = `${file}.${process.pid}.tmp`;
-    writeFileSync(tmp, JSON.stringify({ groups: [...done, group].slice(-HELLO_MAX) }) + "\n", { mode: 0o600 });
-    renameSync(tmp, file);
-    return true;
-  } catch { return false; }
+  try { return HELLO.set(dir, group, true); } catch { return false; }
 }
 
 /**
@@ -1179,15 +1206,13 @@ function helloPoints(url, share, me) {
 
 /**
  * 要不要讲、讲什么。不在星系群里、设置有问题、退出过、讲过：返回 null。要讲时先记下来（同时开着的几个会话只讲一次）
- * @param {string} dir @param {{ url: string, k: string | null }} target @param {string} share @param {string} me
+ * @param {string} dir @param {Resolved} target resolveTarget 的结果 @param {string} share @param {string} me
  * @returns {string | null}
  */
 export function helloContext(dir, target, share, me) {
-  if (!hasScheme(target.url) || isLocal(target.url) || !target.k) return null;
-  const keys = deriveKeys(target.k);
-  if (!keys || leftGroups(dir).includes(keys.group) || !claimHello(dir, keys.group)) return null;
+  if (target.block || target.local || !target.group || !claimHello(dir, target.group)) return null;
   return [
-    `The Agent Loop plugin just connected this computer to galaxy group ${fingerprint(keys.group)} on ${target.url}. This note appears only once.`,
+    `The Agent Loop plugin just connected this computer to galaxy group ${fingerprint(target.group)} on ${target.url}. This note appears only once.`,
     "Deal with the user's message as usual. In the same reply, add a short note in the user's language (a few lines, no headings) that covers:",
     ...helloPoints(target.url, share, me),
   ].join("\n");
@@ -1203,8 +1228,6 @@ export function helloContext(dir, target, share, me) {
 //   - 把说明（和第一次说话时 hook 交给 Claude 的同一份要点）打印出来交给 Claude，并记下讲过了，hook 不再讲
 // 这个命令不是 hook，拿不到 CLAUDE_PLUGIN_OPTION_*：地址从参数来，share、name 从用户级 settings.json 的 pluginConfigs 读。
 // 输出会进对话：不带密钥
-
-export const PLUGIN_ID = "agent-loop@agent-loop";
 
 /** Claude Code 的配置目录 @param {Record<string, string | undefined>} [env] */
 export function configDir(env = process.env) {
@@ -1242,7 +1265,7 @@ export function olderThan(a, b) {
 
 /** 这个会话的记录：<配置目录>/projects/<任意>/<会话编号>.jsonl。找不到返回 "" @param {string} cfg @param {string} sid */
 export function findTranscript(cfg, sid) {
-  if (!/^[A-Za-z0-9-]{1,80}$/.test(sid)) return "";
+  if (!SID_RE.test(sid)) return "";
   const root = join(cfg, "projects");
   try {
     for (const d of readdirSync(root)) {
@@ -1256,18 +1279,9 @@ export function findTranscript(cfg, sid) {
 /** 会话启动时的目录（记录里第一个带 cwd 的行）：hook 用的 CLAUDE_PROJECT_DIR 就是它 @param {string} path */
 export function transcriptCwd(path) {
   if (!path) return "";
-  /** @type {number | undefined} */
-  let fd;
-  try {
-    fd = openSync(path, "r");
-    const buf = Buffer.alloc(Math.min(fstatSync(fd).size, 256 * 1024));
-    readSync(fd, buf, 0, buf.length, 0);
-    for (const line of buf.toString("utf8").split("\n")) {
-      if (!line.includes('"cwd"')) continue;
-      try { const o = JSON.parse(line); if (str(o.cwd)) return o.cwd; } catch { /* 最后一行可能被截断了 */ }
-    }
-  } catch { /* 读不了 */ } finally {
-    if (fd !== undefined) try { closeSync(fd); } catch { /* ignore */ }
+  for (const line of readLines(path, 256 * 1024)) {
+    if (!line.includes('"cwd"')) continue;
+    try { const o = JSON.parse(line); if (str(o.cwd)) return o.cwd; } catch { /* 最后一行可能被截断了 */ }
   }
   return "";
 }
@@ -1310,17 +1324,11 @@ function fileProblem(e, dir) {
  * @param {string} value @param {SetUpOptions} o @returns {Promise<number | "unreachable" | null>}
  */
 async function reportSession(value, o) {
-  const target = parseTarget(value), keys = target.k ? deriveKeys(target.k) : null, local = isLocal(target.url);
-  const { share, me } = savedOptions(o.cfg);
-  const { secret, salt } = loadIdentity(o.dir);
   const transcript = findTranscript(o.cfg, o.sid), cwd = transcriptCwd(transcript) || o.cwd;
-  const hook = { hook_event_name: "SessionStart", session_id: o.sid, source: "resume", cwd, ...(transcript ? { transcript_path: transcript } : {}) };
-  const ev = buildEvent(hook, {
-    salt, level: shareLevel(share, local), local, key: keys?.content, gid: galaxyId(secret), me, projectDir: cwd,
-    readModel: modelFromTranscript, readUsage: (p, sid) => usageFromTranscript(p, usageCacheFile(o.dir, sid)),
-  });
+  const r = reporter(o.dir, parseTarget(value), { ...savedOptions(o.cfg), projectDir: cwd });
+  const ev = r.build({ hook_event_name: "SessionStart", session_id: o.sid, source: "resume", cwd, ...(transcript ? { transcript_path: transcript } : {}) });
   if (!ev) return null;
-  try { return await send(target.url, secret, ev, SEND_TIMEOUT_MS * 2, keys?.access); } catch { return "unreachable"; }
+  try { return await r.send(ev, SEND_TIMEOUT_MS * 2); } catch { return "unreachable"; }
 }
 
 const AGAIN = "ask them to copy the whole message for Claude Code from the Invite panel on the galaxy group's page again";
@@ -1331,8 +1339,9 @@ async function setUp(value, o) {
     return "Problem: no invite link was given to --welcome (it goes right after --welcome, in quotes).\n" +
       `Tell the user this in their language, and ${AGAIN}. Do not run any other command.`;
   }
-  const target = parseTarget(value), keys = target.k ? deriveKeys(target.k) : null;
-  const problem = nodeProblem(process.versions.node) ?? reportProblem(target, null, []);
+  // 退出过这个群又拿邀请回来：就是要回去（下面去掉 left 的记号），不算问题
+  const target = resolveTarget(o.dir, value), keys = target.keys;
+  const problem = nodeProblem(process.versions.node) ?? (target.block === "left" ? null : reportProblem(target, null));
   if (problem) {
     return `Problem: ${problem.replace(/^Agent Loop is not reporting: /, "the invite link given to --welcome is not usable: ")}\n` +
       `Tell the user this in their language, and ${AGAIN}. Do not run any other command.`;
@@ -1343,7 +1352,7 @@ async function setUp(value, o) {
     return `Problem: the Agent Loop plugin is not installed, so the install line (claude plugin install ${PLUGIN_ID} …) did not work.\n` +
       "Tell the user this in their language, with the error that line printed if there was one. Once the cause is fixed, run the install line and then this line again.";
   }
-  if (keys && leftGroups(o.dir).includes(keys.group)) markLeft(o.dir, keys.group, false);   // 退出过这个群又拿邀请回来：就是要回去
+  if (target.block === "left" && keys) markLeft(o.dir, keys.group, false);
   // 换群：已经开着的会话在 /reload-plugins 以前还拿着旧的设置，记下来让它们别再发（见 moved.json）
   const prev = rememberedTarget(o.dir), old = prev ? parseTarget(prev) : null, now = targetKey(target);
   if (old && targetKey(old) !== now) {
@@ -1379,8 +1388,8 @@ async function setUp(value, o) {
   if (opened) lines.push(`(opened in the browser${keys ? " with the group key" : ""}; the key is not shown here)`);
   if (o.created) {
     lines.push(opened
-      ? "The invite link for friends (the group's only key) is in the panel that opened in the browser, and later under Invite on that page. It is not shown here."
-      : "The invite link for friends (the group's only key) is not shown here: run /agent-loop:galaxy to open the group in the browser, where it is under Invite.");
+      ? "The invite link (the group's only key) is in the panel that opened in the browser, and later under Invite on that page. It is not shown here."
+      : "The invite link (the group's only key) is not shown here: run /agent-loop:galaxy to open the group in the browser, where it is under Invite.");
   }
   if (!ok) {
     const p = status === "unreachable" ? `could not reach ${target.url}. Check that the server is running and reachable from this computer.`
@@ -1416,6 +1425,26 @@ export async function send(url, secret, ev, timeoutMs, access) {
   });
   await res.arrayBuffer().catch(() => {});
   return res.status;
+}
+
+/**
+ * 往一个目标报事件：hook、替旧设置的会话发 SessionEnd、补发 SessionEnd、接入时报这个会话都用它，拼事件的方式只有这一份
+ * @param {string} dir 插件数据目录 @param {{ url: string, k: string | null }} target
+ * @param {{ share: string, me: string, projectDir?: string }} o
+ */
+function reporter(dir, target, { share, me, projectDir }) {
+  const local = isLocal(target.url), keys = target.k ? deriveKeys(target.k) : null;
+  const { secret, salt } = loadIdentity(dir);
+  /** @type {Parameters<typeof buildEvent>[1]} */
+  const ctx = {
+    salt, level: shareLevel(share, local), local, key: keys?.content, gid: galaxyId(secret), me, projectDir,
+    readModel: modelFromTranscript, readUsage: (p, sid) => usageFromTranscript(p, usageCacheFile(dir, sid)),
+  };
+  return {
+    secret,
+    build: (/** @type {any} */ hook) => buildEvent(hook, ctx),
+    send: (/** @type {OutEvent} */ ev, /** @type {number} */ timeoutMs) => send(target.url, secret, ev, timeoutMs, keys?.access),
+  };
 }
 
 async function readStdin() {
@@ -1483,20 +1512,17 @@ function openBrowser(url) {
  * @returns {Promise<string>}
  */
 export async function galaxyCommand(dir, value, open) {
-  const target = parseTarget(value);
-  const keys = target.k && !isLocal(target.url) ? deriveKeys(target.k) : null;
+  const target = resolveTarget(dir, value);
   const node = nodeProblem(process.versions.node);
-  if (keys && leftGroups(dir).includes(keys.group)) {
-    const out = `No galaxy address: you left galaxy group ${fingerprint(keys.group)} on ${target.url} with /agent-loop:leave, ` +
-      "so your galaxy is not shown anywhere right now. To go back to that group, run /agent-loop:rejoin. " +
-      "To show it on this computer instead, set server_url back to http://127.0.0.1:4317 with /plugin configure agent-loop@agent-loop.";
+  if (target.block === "left") {
+    const out = `No galaxy address: ${blockMessage("left", target)}`;
     return node ? `${out}\nProblem: ${node}` : out;
   }
   // 服务器旧了（不答版本）、连不上：给旧页面也认的 #g=
   const fresh = hasScheme(target.url) && newPage(serverVersion(await serverHealth(target.url)));
   let out = galaxyUrl(dir, value, false, fresh);
   if (target.k && open && open(galaxyUrl(dir, value, true, fresh))) out += "\n(opened in your browser with the group key; the key is not shown here)";
-  const problem = node ?? reportProblem(target, lastStatus(dir), leftGroups(dir));
+  const problem = currentProblem(dir, target);
   return problem ? `${out}\nProblem: ${problem}` : out;
 }
 
@@ -1638,30 +1664,29 @@ export async function createGroup(given, o) {
  * @param {number} [now]
  */
 export function statusCommand(dir, value, cfg, now = Date.now()) {
-  const target = parseTarget(value), local = isLocal(target.url);
-  const keys = target.k && !local ? deriveKeys(target.k) : null;
-  const left = !!keys && leftGroups(dir).includes(keys.group);
+  const target = resolveTarget(dir, value), local = target.local;
   const { share, me } = savedOptions(cfg);
   const last = lastStatus(dir), have = installedVersion(cfg);
-  const problem = nodeProblem(process.versions.node) ?? reportProblem(target, last, leftGroups(dir));
-  const where = local ? `a server on this computer (${target.url})` : keys ? `galaxy group ${fingerprint(keys.group)} on ${target.url}` : target.url;
+  const problem = currentProblem(dir, target);
+  const where = local ? `a server on this computer (${target.url})` : target.group ? `galaxy group ${fingerprint(target.group)} on ${target.url}` : target.url;
   const mine = last && last.url === target.url ? last.status : null;
   const lastLine = mine === null ? "nothing sent to this server yet"
     : mine === "unreachable" ? "could not reach the server"
     : mine < 300 ? "accepted" : `refused (HTTP ${mine})`;
   // reportProblem 不管 429、5xx（多半一会儿就好），可上次确实没送到：不能说「在报」
-  const state = left ? "left this group with /agent-loop:leave, so nothing is sent (/agent-loop:rejoin goes back)"
-    : problem ? "not reporting (see Problem)"
+  // 退出过、设置不对：Problem 那一行说清楚（和 hook 的提示是同一句）
+  const state = problem ? "not reporting (see Problem)"
     : mine === null ? "set up; nothing sent yet"
     : mine === "unreachable" || mine >= 300 ? "not reporting right now: the last report did not get through (see Last report); every step tries again"
     : "reporting";
   const update = have && olderThan(have, PLUGIN_VERSION) ? `; run \`claude plugin update ${PLUGIN_ID}\`` : "";
-  // 换过群以后还拿着旧设置的会话（staleTarget）什么都不发：这条命令看不到是哪个会话在跑，只能说最近见到过
+  // 换过群以后还拿着旧设置的会话（resolveTarget 的 moved）什么都不发：这条命令看不到是哪个会话在跑，只能说最近见到过。
+  // 退出过这个群时反正什么都不发，不提
   const staleAgo = now - staleSeen(dir), STALE_RECENT_MS = 30 * 60_000;
   const lines = [
     `Reports to: ${where}`,
     `State: ${state}`,
-    ...(staleAgo >= 0 && staleAgo < STALE_RECENT_MS && !left
+    ...(staleAgo >= 0 && staleAgo < STALE_RECENT_MS && target.block !== "left"
       ? [`Old sessions: ${Math.max(1, Math.round(staleAgo / 60_000))} min ago a session that was open before the last switch of server_url (including the one that ran /agent-loop:create or the setup) still had the old setting, so it sends nothing. Run /reload-plugins in each session that was open before the switch.`]
       : []),
     `Last report: ${lastLine}`,
@@ -1669,58 +1694,52 @@ export function statusCommand(dir, value, cfg, now = Date.now()) {
     `Sharing: ${share || "auto"} (${SHARE_WHAT[shareLevel(share, local)][0]} for this server)`,
     `Plugin: ${PLUGIN_VERSION}${have && have !== PLUGIN_VERSION ? ` (installed: ${have}${update})` : ""}`,
   ];
-  if (problem && !left) lines.push(`Problem: ${problem}`);
+  if (problem) lines.push(`Problem: ${problem}`);
   return lines.join("\n");
 }
 
+/** 命令（不是 hook）的参数：数据目录（命令正文里的 ${CLAUDE_PLUGIN_DATA} 没被替换时用 dataDir()）、后面的词、浏览器开不开。
+ *  命令文件把 "$ARGUMENTS" 整个当一个参数传进来（/agent-loop:create https://srv --no-open 是一个参数）：拆开再认
+ *  @param {string[]} args */
+function commandArgs(args) {
+  const dir = args[1] && !args[1].startsWith("${") ? args[1] : dataDir();
+  const words = args.slice(2).flatMap(a => a.split(/\s+/)).filter(Boolean);
+  return {
+    dir,
+    /** 用户给的地址：第一个不以 -- 开头、也不是没被替换的 $ARGUMENTS 的词 */
+    given: words.find(w => !w.startsWith("--") && !w.startsWith("$")) ?? "",
+    open: words.includes("--no-open") ? null : openBrowser,
+  };
+}
+
+/** 写到标准输出，写完再返回（之后进程马上退出） @param {string} out @returns {Promise<void>} */
+const print = out => new Promise(r => process.stdout.write(out + "\n", () => r()));
+
 async function main() {
   const args = process.argv.slice(2);
-  if (args[0] === "--galaxy") {
-    // /galaxy 命令：命令里的 shell 拿不到插件的环境变量，所以数据目录从参数传进来；地址从 hook 记下的 server.json 读
-    const dir = args[1] && !args[1].startsWith("${") ? args[1] : dataDir();
-    const given = args[2] && !args[2].startsWith("${") ? args[2] : "";
-    const out = await galaxyCommand(dir, given || rememberedTarget(dir) || serverUrl(), args.includes("--no-open") ? null : openBrowser);
-    await new Promise(r => process.stdout.write(out + "\n", () => r(undefined)));
-    return;
+  // /agent-loop:galaxy、leave、rejoin、status：命令里的 shell 拿不到插件的环境变量（CLAUDE_PLUGIN_OPTION_* 也拿不到，
+  // docs/step0-findings.md），所以数据目录从参数传进来，地址从 hook 记下的 server.json 读；没记过就是默认的本机地址（parseTarget）
+  if (args[0] === "--galaxy" || args[0] === "--leave" || args[0] === "--rejoin" || args[0] === "--status") {
+    const { dir, given, open } = commandArgs(args);
+    const value = given || rememberedTarget(dir) || "";
+    return print(args[0] === "--galaxy" ? await galaxyCommand(dir, value, open)
+      : args[0] === "--status" ? statusCommand(dir, rememberedTarget(dir) || "", configDir())
+      : await leaveOrRejoin(args[0] === "--leave" ? "leave" : "rejoin", dir, value, open));
   }
   if (args[0] === "--welcome") {
-    // 接入（页面上那段话的最后一行）：Claude 在 Bash 里跑，从插件市场的目录。数据目录是插件装好以后 hook 用的那个
-    const cfg = configDir(), env = process.env.CLAUDE_PLUGIN_DATA;
+    // 接入（页面上那段话的最后一行）：Claude 在 Bash 里跑，从插件市场的目录。数据目录是插件装好以后 hook 用的那个。
     // 链接是第一个不以 -- 开头的参数（--no-open 放在前面也认得）；没有就照实说，不退回本机地址
-    const out = await welcome(args.slice(1).find(a => !a.startsWith("--")) ?? "", {
-      cfg, dir: env && !env.startsWith("${") ? env : installedDataDir(cfg),
-      sid: (process.env.CLAUDE_CODE_SESSION_ID || "").trim(), cwd: process.cwd(), open: args.includes("--no-open") ? null : openBrowser,
-    });
-    await new Promise(r => process.stdout.write(out + "\n", () => r(undefined)));
-    return;
+    return print(await welcome(args.slice(1).find(a => !a.startsWith("--")) ?? "", {
+      cfg: configDir(), dir: dataDir(), sid: (process.env.CLAUDE_CODE_SESSION_ID || "").trim(), cwd: process.cwd(),
+      open: args.includes("--no-open") ? null : openBrowser,
+    }));
   }
   if (args[0] === "--create") {
-    // /agent-loop:create：数据目录从参数传进来，后面是用户给的服务器地址（可以没有：命令正文里的 $ARGUMENTS 是空的或没被替换）
-    // 命令文件把 "$ARGUMENTS" 整个当一个参数传进来（/agent-loop:create https://srv --no-open 是一个参数）：拆开再认
-    const dir = args[1] && !args[1].startsWith("${") ? args[1] : dataDir();
-    const words = args.slice(2).flatMap(a => a.split(/\s+/)).filter(Boolean);
-    const given = words.find(w => !w.startsWith("--") && !w.startsWith("$")) ?? "";
-    const out = await createGroup(given, {
-      cfg: configDir(), dir, sid: (process.env.CLAUDE_CODE_SESSION_ID || "").trim(), cwd: process.cwd(),
-      open: words.includes("--no-open") ? null : openBrowser, save: saveServerUrl,
-    });
-    await new Promise(r => process.stdout.write(out + "\n", () => r(undefined)));
-    return;
-  }
-  if (args[0] === "--status") {
-    const dir = args[1] && !args[1].startsWith("${") ? args[1] : dataDir();
-    const out = statusCommand(dir, rememberedTarget(dir) || serverUrl(), configDir());
-    await new Promise(r => process.stdout.write(out + "\n", () => r(undefined)));
-    return;
-  }
-  if (args[0] === "--leave" || args[0] === "--rejoin") {
-    // /agent-loop:leave、/agent-loop:rejoin：和 /galaxy 一样，数据目录从参数传进来，地址从 server.json 读
-    const dir = args[1] && !args[1].startsWith("${") ? args[1] : dataDir();
-    const given = args[2] && !args[2].startsWith("${") && !args[2].startsWith("--") ? args[2] : "";
-    const out = await leaveOrRejoin(args[0] === "--leave" ? "leave" : "rejoin", dir, given || rememberedTarget(dir) || serverUrl(),
-      args.includes("--no-open") ? null : openBrowser);
-    await new Promise(r => process.stdout.write(out + "\n", () => r(undefined)));
-    return;
+    // 后面是用户给的服务器地址（可以没有：命令正文里的 $ARGUMENTS 是空的或没被替换）
+    const { dir, given, open } = commandArgs(args);
+    return print(await createGroup(given, {
+      cfg: configDir(), dir, sid: (process.env.CLAUDE_CODE_SESSION_ID || "").trim(), cwd: process.cwd(), open, save: saveServerUrl,
+    }));
   }
   const text = await readStdin();
   const hook = JSON.parse(text);
@@ -1730,64 +1749,56 @@ async function main() {
     // 异步 hook 的输出不会显示给用户、也不进上下文，所以这一步必须是同步的。
     // 会话开始时：设置或上次的发送有问题就提示一行（压缩上下文时不重复）。
     // 用户说话时：第一次接上这个星系群，把说明交给 Claude（helloContext）
-    // 换过群以后还没 /reload-plugins 的旧会话：说话、/clear 时提示一行（新开的会话不算，见 staleTarget）
+    // 换过群以后还没 /reload-plugins 的旧会话：说话、/clear 时提示一行（新开的会话不算，见 resolveTarget）
     let out = null;
-    const dir = dataDir();
-    const stale = !(hook.hook_event_name === "SessionStart" && hook.source === "startup") && movedFrom(dir).includes(targetKey(target));
-    if (stale) {
-      if (hook.source !== "compact") out = { systemMessage: staleMessage(target.url) };
+    const dir = dataDir(), t = resolveTarget(dir, target, hook);
+    if (t.block === "moved") {
+      if (hook.source !== "compact") out = { systemMessage: `Agent Loop: ${blockMessage("moved", t)}` };
     } else if (hook.hook_event_name === "UserPromptSubmit") {
       // 设置或上次的发送有问题时不讲（会话开始时已经提示过怎么改）
-      const bad = nodeProblem(process.versions.node) ?? reportProblem(target, lastStatus(dir), leftGroups(dir));
-      const ctx = bad ? null : helloContext(dir, target, share, me);
+      const ctx = currentProblem(dir, t) ? null : helloContext(dir, t, share, me);
       if (ctx) out = { hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: ctx } };
     } else if (hook.source !== "compact") {
-      const problem = nodeProblem(process.versions.node) ?? reportProblem(target, lastStatus(dir), leftGroups(dir));
+      const problem = currentProblem(dir, t);
       if (problem) out = { systemMessage: problem };
     }
-    if (out) await new Promise(r => process.stdout.write(JSON.stringify(out) + "\n", () => r(undefined)));
+    if (out) await print(JSON.stringify(out));
     return;
   }
-  const local = isLocal(target.url);
-  const keys = target.k ? deriveKeys(target.k) : null;
-  const dir = dataDir();
+  const dir = dataDir(), t = resolveTarget(dir, target, hook);
   const value = (process.env.CLAUDE_PLUGIN_OPTION_SERVER_URL || "").trim();
-  // 地址漏了 http://，或者发往别处却没有邀请链接（或者链接坏了）：什么都不发。会话开始时的检查会告诉用户。
-  // 这时只在还没记过地址时记一下（新用户设错了，/galaxy 也能照实说出问题）；记过就不动：
-  // 改设置以前开的会话还拿着旧值，不能让它把新会话记下的好地址冲掉
-  if (!hasScheme(target.url) || (!local && !keys)) { if (!rememberedTarget(dir)) rememberTarget(dir, value); return; }
   // 换过群以后还没 /reload-plugins 的旧会话：不发，也不把旧链接写回 server.json
-  if (staleTarget(dir, target, hook)) {
+  if (t.block === "moved") {
     noteStale(dir);
     if (hook.hook_event_name === "SessionEnd") await endInCurrent(dir, hook, share, me);
     return;
   }
+  // 地址漏了 http://，或者发往别处却没有邀请链接（或者链接坏了）：什么都不发。会话开始时的检查会告诉用户。
+  // 这时只在还没记过地址时记一下（新用户设错了，/galaxy 也能照实说出问题）；记过就不动：
+  // 改设置以前开的会话还拿着旧值，不能让它把新会话记下的好地址冲掉
+  if (t.block === "scheme" || t.block === "nokey" || t.block === "badkey") { if (!rememberedTarget(dir)) rememberTarget(dir, value); return; }
+  // 新开的会话拿的一定是当前的设置：它要是换走了的旧值，说明用户又改回去了，去掉记号照常发（见 moved.json）
+  if (isStartup(hook)) try { markMoved(dir, markOf(t.url, t.group), false); } catch { /* 写不了：这次照常发 */ }
   rememberTarget(dir, value);
   // 用 /agent-loop:leave 退出过这个星系群：不发（会话开始时的检查会说明）
-  if (keys && leftGroups(dir).includes(keys.group)) return;
-  const { secret, salt } = loadIdentity(dir);
-  const ev = buildEvent(hook, {
-    salt, level: shareLevel(share, local), local, key: keys?.content, gid: galaxyId(secret), me,
-    projectDir: process.env.CLAUDE_PROJECT_DIR, readModel: modelFromTranscript,
-    readUsage: (p, sid) => usageFromTranscript(p, usageCacheFile(dir, sid)),
-  });
+  if (t.block) return;
+  const r = reporter(dir, t, { share, me, projectDir: process.env.CLAUDE_PROJECT_DIR });
+  const ev = r.build(hook);
   if (!ev) return;
   if (ev.ev === "SessionStart" && ev.source === "startup") pruneUsageCache(dir);
   // SessionEnd 的发送超时很短，超时不代表服务器有问题：它的结果不记
-  if (ev.ev === "SessionEnd") return void await send(target.url, secret, ev, SESSION_END_TIMEOUT_MS, keys?.access);
+  if (ev.ev === "SessionEnd") return void await r.send(ev, SESSION_END_TIMEOUT_MS);
   /** @type {number | "unreachable"} */
   let status;
-  try { status = await send(target.url, secret, ev, SEND_TIMEOUT_MS, keys?.access); } catch { status = "unreachable"; }
+  try { status = await r.send(ev, SEND_TIMEOUT_MS); } catch { status = "unreachable"; }
   recordStatus(dir, target.url, status);
   // 会话开始、说话时（都是异步的 hook，不耽误用户）：替结束了却没送出 SessionEnd 的会话补发。服务器收下了才扫
   if (status === 204 && !ev.agent && (ev.ev === "SessionStart" || ev.ev === "UserPromptSubmit")) {
     await sweepEnded({
       dir, cfg: configDir(), self: String(hook.session_id),
       end: sid => {
-        const gone = buildEvent({ hook_event_name: "SessionEnd", session_id: sid, reason: "other", cwd: hook.cwd }, {
-          salt, level: shareLevel(share, local), local, key: keys?.content, gid: galaxyId(secret), me, projectDir: process.env.CLAUDE_PROJECT_DIR,
-        });
-        return gone ? send(target.url, secret, gone, SEND_TIMEOUT_MS, keys?.access) : Promise.resolve();
+        const gone = r.build({ hook_event_name: "SessionEnd", session_id: sid, reason: "other", cwd: hook.cwd });
+        return gone ? r.send(gone, SEND_TIMEOUT_MS) : Promise.resolve();
       },
     });
   }
