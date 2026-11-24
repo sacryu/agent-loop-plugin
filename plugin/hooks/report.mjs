@@ -34,7 +34,7 @@ export const PLUGIN_ID = "agent-loop@agent-loop";
 export const PROTOCOL_VERSION = 2;
 /** 插件自己的版本，每次上报放在请求头 x-agent-loop-plugin 里，页面据此提示更新。
  *  和 plugin.json 的 version、shared/src/version.ts 的 PLUGIN_VERSION 一致（测试检查） */
-export const PLUGIN_VERSION = "0.2.14";
+export const PLUGIN_VERSION = "0.2.15";
 /** 第一个由插件建群（/agent-loop:create）的版本：从这一版起页面认 #galaxy=、&created。插件和私有部署分开升级，
  *  所以打开页面前先问服务器的版本（/healthz 的 version），旧的服务器给 #g=，也不在那里建群。
  *  和 shared/src/version.ts 的 CREATE_SINCE 一致（测试检查） */
@@ -43,7 +43,7 @@ export const CREATE_SINCE = "0.2.11";
  *  和 shared/src/version.ts 的 LEFT_SINCE 一致（测试检查） */
 export const LEFT_SINCE = "0.2.12";
 export const SEND_TIMEOUT_MS = 2000;
-/** SessionEnd 是同步 hook（会话退出时异步进程会被杀掉，见 docs/step0-findings.md）。Claude Code 给 SessionEnd 的
+/** SessionEnd 是同步 hook（实测：会话退出时异步进程会被杀掉）。Claude Code 给 SessionEnd 的
  *  总时间约 1.5 秒，超过就取消并在终端打一行提示；Node 启动的时间也算在里面，所以发送超时要短 */
 export const SESSION_END_TIMEOUT_MS = 600;
 /** 本机、档位 2 附带的原样数据过大时，把长字符串截短 */
@@ -405,7 +405,7 @@ export function slotsOf(ev, gid = "") {
 /** 附加校验数据 @param {string} slot @param {string} sid @param {string} k */
 export const aadOf = (slot, sid, k) => `agent-loop/${PROTOCOL_VERSION}|${slot}|${sid}|${k}`;
 
-// ---- 模型名：hook 数据里没有（docs/step0-findings.md）。主对话的在 usageFromTranscript 里顺带取；
+// ---- 模型名：hook 数据里没有（实测）。主对话的在 usageFromTranscript 里顺带取；
 // 它取不到时（子 agent 的事件、记录里还没有主对话的回答）从会话记录末尾最后一条回答里取
 
 /** @param {unknown} path @returns {string | undefined} */
@@ -773,7 +773,7 @@ export function dataDir() {
 }
 
 /**
- * 插件设置。Claude Code 以 CLAUDE_PLUGIN_OPTION_<KEY> 传进来；没设过时什么都不传（docs/step0-findings.md 第 7 项）。
+ * 插件设置。Claude Code 以 CLAUDE_PLUGIN_OPTION_<KEY> 传进来；没设过时什么都不传（实测）。
  *   server_url：本机地址，或者一条邀请链接（https://<服务器>/#k=<K>）
  *   share：auto（默认）、anonymous、summary、full
  *   name：星系的名字，空着就用自动生成的星表编号
@@ -798,7 +798,7 @@ export function parseTarget(v) {
 
 /**
  * 记下最近一次用的 server_url，给 /galaxy 用：server_url 是敏感设置（邀请链接里有密钥），存在系统的凭据存储里，
- * 命令正文里拿不到（docs/step0-findings.md）。文件在插件数据目录里，权限 0600，和安装密钥放在一起。变了才写
+ * 命令正文里拿不到（实测）。文件在插件数据目录里，权限 0600，和安装密钥放在一起。变了才写
  * @param {string} dir @param {string} value
  */
 export function rememberTarget(dir, value) {
@@ -1100,7 +1100,7 @@ export async function sweepEnded({ dir, cfg, self, end, now = Date.now(), isAliv
 
 // ---- 上报不出去时告诉用户
 //
-// 异步 hook 失败时 Claude Code 什么都不显示（docs/step0-findings.md），设错了 server_url 的人只会觉得「装了没用」。
+// 异步 hook 失败时 Claude Code 什么都不显示（实测），设错了 server_url 的人只会觉得「装了没用」。
 // 所以每次发送后把结果记进 status.json（变了才写），会话开始时检查设置和上次的结果，有问题就在 Claude Code 里提示一行。
 
 /**
@@ -1152,7 +1152,7 @@ export function reportProblem(target, last) {
   const s = last.status;
   if (s === "unreachable") {
     return target.local
-      ? `Agent Loop could not reach ${url} last time. To watch on this computer, run \`npx agent-loop\`. To join a galaxy group instead, paste its invite link (…/#k=…) into the plugin's server_url setting.`
+      ? `Agent Loop could not reach ${url} last time. To watch on this computer, run \`npx agent-loop-viz\`. To join a galaxy group instead, paste its invite link (…/#k=…) into the plugin's server_url setting.`
       : `Agent Loop could not reach ${url} last time. Check that the server is running and reachable from this computer.`;
   }
   if (s === 401 || s === 403) return `Agent Loop: ${url} refused the reports (HTTP ${s}). The invite link may be wrong, or this server only accepts certain galaxy groups. ${FIX_LINK}`;
@@ -1239,7 +1239,7 @@ export function installedDataDir(cfg = configDir()) {
   return join(cfg, "plugins", "data", PLUGIN_ID.replace("@", "-"));
 }
 
-/** 用户级设置里插件的 share、name（不敏感的设置存在这里，见 docs/step0-findings.md） @param {string} cfg */
+/** 用户级设置里插件的 share、name（不敏感的设置存在这里，实测） @param {string} cfg */
 export function savedOptions(cfg) {
   try {
     const o = JSON.parse(readFileSync(join(cfg, "settings.json"), "utf8")).pluginConfigs?.[PLUGIN_ID]?.options ?? {};
@@ -1534,7 +1534,7 @@ export async function galaxyCommand(dir, value, open) {
 //      服务器够不够新（version：比 CREATE_SINCE 旧的页面不认 &created，邀请链接没处显示）
 //   2. 本机生成 K，先把这个会话报到新群：服务器收下了，群才算建起来（群数上限、每个 IP 的建群限额都在这一步）
 //   3. 交给 `claude plugin configure --values-stdin` 存进 server_url：从标准输入给，不进命令行参数、
-//      shell 历史和对话；和接入命令存的是同一个地方（docs/step0-findings.md）。存不进去就把星系从新群里撤出来
+//      shell 历史和对话；和接入命令存的是同一个地方（实测）。存不进去就把星系从新群里撤出来
 //   4. 后面和接入命令一样（setUp）：换群的记号、带着密钥在浏览器里打开（&created：页面弹邀请链接）
 // 输出会进对话：不带密钥。命令文件设了 disable-model-invocation，只有用户自己敲得出来
 
@@ -1587,7 +1587,7 @@ export const newK = () => b64u(randomBytes(32));
 
 /**
  * 能不能在这台服务器上建群，看它 /healthz 答的（serverHealth）。能返回 null，不能返回原因
- *   - 本机的服务（npx agent-loop）没有群
+ *   - 本机的服务（npx agent-loop-viz）没有群
  *   - 服务器比 CREATE_SINCE 旧（不答 version）：它的页面不认 &created，新群的邀请链接没有地方显示
  *   - open 是 false：白名单的服务器只收管理员登记的群
  * @param {string} url @param {Awaited<ReturnType<typeof serverHealth>>} r @returns {string | null}
@@ -1597,13 +1597,13 @@ export function createBlocked(url, r) {
   const h = r.h;
   if (r.http >= 300) return `${url} did not answer like an Agent Loop server (HTTP ${r.http})`;
   if (!h || typeof h !== "object" || h.ok !== true) return `${url} did not answer like an Agent Loop server`;
-  if (h.local === true) return `${url} is a server for a single computer (npx agent-loop), which has no galaxy groups`;
+  if (h.local === true) return `${url} is a server for a single computer (npx agent-loop-viz), which has no galaxy groups`;
   const v = serverVersion(r);
   if (!newPage(v)) {
     return `${url} runs an older Agent Loop server (${v || "before 0.2.11"}) whose page cannot show a new group's invite link. ` +
       `Ask its admin to update the server to ${CREATE_SINCE} or newer, or join one of its groups with an invite link`;
   }
-  if (h.open === false) return `${url} only accepts galaxy groups its admin has registered. Ask the admin for an invite link (made with npx agent-loop invite) and join with that`;
+  if (h.open === false) return `${url} only accepts galaxy groups its admin has registered. Ask the admin for an invite link (made with npx agent-loop-viz invite) and join with that`;
   return null;
 }
 
@@ -1612,7 +1612,7 @@ function createRefused(url, status) {
   if (status === "unreachable") return `could not reach ${url} to send the first report`;
   if (status === 503) return `${url} is full (HTTP 503): it has reached its limit of galaxy groups or galaxies. Try again later or ask its admin`;
   if (status === 429) return `${url} is limiting new galaxy groups and galaxies from this network (HTTP 429). Try again in an hour`;
-  if (status === 403) return `${url} only accepts galaxy groups its admin has registered (HTTP 403). Ask the admin for an invite link (made with npx agent-loop invite) and join with that`;
+  if (status === 403) return `${url} only accepts galaxy groups its admin has registered (HTTP 403). Ask the admin for an invite link (made with npx agent-loop-viz invite) and join with that`;
   return `${url} refused the first report to the new group (HTTP ${status})`;
 }
 
@@ -1717,8 +1717,8 @@ const print = out => new Promise(r => process.stdout.write(out + "\n", () => r()
 
 async function main() {
   const args = process.argv.slice(2);
-  // /agent-loop:galaxy、leave、rejoin、status：命令里的 shell 拿不到插件的环境变量（CLAUDE_PLUGIN_OPTION_* 也拿不到，
-  // docs/step0-findings.md），所以数据目录从参数传进来，地址从 hook 记下的 server.json 读；没记过就是默认的本机地址（parseTarget）
+  // /agent-loop:galaxy、leave、rejoin、status：命令里的 shell 拿不到插件的环境变量（CLAUDE_PLUGIN_OPTION_* 也拿不到，实测），
+  // 所以数据目录从参数传进来，地址从 hook 记下的 server.json 读；没记过就是默认的本机地址（parseTarget）
   if (args[0] === "--galaxy" || args[0] === "--leave" || args[0] === "--rejoin" || args[0] === "--status") {
     const { dir, given, open } = commandArgs(args);
     const value = given || rememberedTarget(dir) || "";

@@ -1,6 +1,6 @@
 # Agent Loop plugin for Claude Code
 
-Draws your Claude Code sessions as planetary systems: every session is a planet, every tool call is a ray whose length is how long it took. This repository holds only the Claude Code plugin; the viewer runs on an Agent Loop server (one on your computer, or a galaxy group server someone invited you to).
+Draws your Claude Code sessions as planetary systems: every session is a planet, every tool call is a ray whose length is how long it took. This repository holds only the Claude Code plugin; the viewer runs on an Agent Loop server (one on your computer, or a galaxy group server someone invited you to). To run one on your computer: `npx agent-loop-viz` (Node.js 20+). The server, the web page and a [live demo](https://sacryu.github.io/agent-loop-viz/) are in [sacryu/agent-loop-viz](https://github.com/sacryu/agent-loop-viz).
 
 [中文说明](#中文)
 
@@ -57,7 +57,7 @@ Anything beyond anonymous categories and timings is encrypted with AES-256-GCM b
 
 ## 中文
 
-Agent Loop 把正在跑的 Claude Code 对话画成行星系：每个对话是一颗行星，每次工具调用是一根射线，长度就是耗时。这个仓库只有 Claude Code 插件；画面在 Agent Loop 服务器上看（你自己电脑上的，或者邀请你加入的星系群服务器）。
+Agent Loop 把正在跑的 Claude Code 对话画成行星系：每个对话是一颗行星，每次工具调用是一根射线，长度就是耗时。这个仓库只有 Claude Code 插件；画面在 Agent Loop 服务器上看（你自己电脑上的，或者邀请你加入的星系群服务器）。在自己电脑上起一个：`npx agent-loop-viz`（Node.js 20 或更新）。服务器、页面和[在线演示](https://sacryu.github.io/agent-loop-viz/)在 [sacryu/agent-loop-viz](https://github.com/sacryu/agent-loop-viz)。
 
 **最省事的安装**：邀请你的人在星系群页面上点「邀请」→「复制给 Claude Code 的话」，发给你一段话。把它发给你的 Claude Code：它会加上这个插件市场、带着你的邀请链接装好插件，再跑插件里的 `report.mjs --welcome`。这一步把你正在用的这个会话直接报上去，在浏览器里打开你自己的星系，并让 Claude 讲清楚插件做什么、会发出什么（见下），问你要不要改 `name` 和 `share`。然后执行 `/reload-plugins`（Claude 执行不了），这个会话的每一步就会画出来；新开的会话会自己上报。你先打开了邀请链接的话，页面上也会给出同一段话。
 
